@@ -1,0 +1,23 @@
+[project]
+name = "moktan"
+version = "0.1.0"
+description = "File-based checkpointing DataFrame pipeline runner"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "polars>=1.42.1",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.14,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6.156.1",
+    "pytest>=9.1.1",
+    "ty>=0.0.56",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
