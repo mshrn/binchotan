@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from graphlib import TopologicalSorter
@@ -13,7 +14,7 @@ from queue import SimpleQueue
 
 import polars as pl
 
-from moktan.graph import Graph, build_graph, consumer_counts
+from moktan.graph import Graph, build_graph
 from moktan.node import Node
 
 logger = logging.getLogger("moktan")
@@ -32,15 +33,14 @@ class PipelineError(RuntimeError):
 class Plan:
     """Pass 1 output: which nodes are stale and which ones Pass 2 must touch.
 
-    ``recompute`` is every node whose ``f`` must run. ``load_targets`` is the
-    non-stale nodes that feed a recompute node and must therefore be read from
-    disk. ``pass2`` is their union -- everything the Pass 2 scheduler submits.
-    Nodes outside ``pass2`` are never touched: not recomputed, not loaded.
+    ``recompute`` is every node whose ``f`` must run. ``pass2`` additionally
+    includes the non-stale nodes that feed a recompute node and must
+    therefore be read from disk. Nodes outside ``pass2`` are never touched:
+    not recomputed, not loaded.
     """
 
     needs_compute: dict[Node, bool]
     recompute: frozenset[Node]
-    load_targets: frozenset[Node]
     pass2: frozenset[Node]
 
 
@@ -61,9 +61,10 @@ def run(root: Node, *, force: bool = False, max_workers: int = 1) -> pl.DataFram
             logger.info("skipped %s", node.path)
 
     if not plan.needs_compute[root]:
-        df = pl.read_parquet(root.path)
-        logger.info("loaded %s", root.path)
-        return df
+        try:
+            return _compute_or_load(root, False, {})
+        except Exception as exc:
+            raise PipelineError(root) from exc
 
     cache = _execute_pass2(graph, plan, root, max_workers=max_workers)
     return cache[root]
@@ -72,51 +73,42 @@ def run(root: Node, *, force: bool = False, max_workers: int = 1) -> pl.DataFram
 def _plan(graph: Graph, *, force: bool) -> Plan:
     needs_compute = _determine_stale(graph, force=force)
     recompute = frozenset(node for node in graph.order if needs_compute[node])
-    load_targets = frozenset(
+    load_targets = (
         dep for node in recompute for dep in node.deps.values() if not needs_compute[dep]
     )
     return Plan(
-        needs_compute=needs_compute,
-        recompute=recompute,
-        load_targets=load_targets,
-        pass2=recompute | load_targets,
+        needs_compute=needs_compute, recompute=recompute, pass2=recompute.union(load_targets)
     )
 
 
 def _determine_stale(graph: Graph, *, force: bool) -> dict[Node, bool]:
     """Pass 1: sequentially decide, in topological order, which nodes are stale.
 
-    Each node's mtime is stat'd at most once (memoized), regardless of how many
-    consumers it has.
+    Each node's file is stat'd at most once, regardless of how many consumers
+    it has: ``fresh_mtimes`` records a node's mtime only once it's decided
+    fresh, and only fresh nodes are ever looked up there (a stale dep always
+    short-circuits its consumer via the recompute-propagation check first).
     """
-    needs_compute: dict[Node, bool] = {}
-    mtimes: dict[Node, float | None] = {}
+    if force:
+        return dict.fromkeys(graph.order, True)
 
-    def mtime(node: Node) -> float | None:
-        if node not in mtimes:
-            try:
-                mtimes[node] = node.path.stat().st_mtime
-            except FileNotFoundError:
-                mtimes[node] = None
-        return mtimes[node]
+    needs_compute: dict[Node, bool] = {}
+    fresh_mtimes: dict[Node, float] = {}
 
     for node in graph.order:
-        node_mtime = mtime(node)
-        if force or node_mtime is None:
+        try:
+            node_mtime = node.path.stat().st_mtime
+        except FileNotFoundError:
             needs_compute[node] = True
             continue
         if any(needs_compute[dep] for dep in node.deps.values()):
             needs_compute[node] = True
             continue
-        # By this point every dep has needs_compute[dep] is False, so its file
-        # exists and mtime(dep) is never None -- checked anyway for typing.
-        if any(
-            (dep_mtime := mtime(dep)) is not None and dep_mtime > node_mtime
-            for dep in node.deps.values()
-        ):
+        if any(fresh_mtimes[dep] > node_mtime for dep in node.deps.values()):
             needs_compute[node] = True
             continue
         needs_compute[node] = False
+        fresh_mtimes[node] = node_mtime
     return needs_compute
 
 
@@ -155,8 +147,7 @@ def _execute_pass2(
     # by get_ready(), so the execution loops below don't need to special-case
     # (and separately log) skipping them -- run() already did that once.
     sorter = graph.sorter(plan.pass2)
-    edges = {node: node.deps.values() for node in plan.recompute}
-    counts = consumer_counts(plan.pass2, edges)
+    counts = Counter(dep for node in plan.recompute for dep in node.deps.values())
     cache: dict[Node, pl.DataFrame] = {}
 
     if max_workers == 1:
@@ -217,6 +208,13 @@ def _run_parallel(
     root: Node,
     max_workers: int,
 ) -> None:
+    # Guards cache/counts, which spec section 5 requires to be lock-protected
+    # during parallel execution. In the current implementation every mutation
+    # of cache/counts actually happens on the main thread (worker threads only
+    # run _compute_or_load, which touches neither) -- the lock is a no-op today
+    # but is the precondition that would make it safe to move that bookkeeping
+    # into a worker-thread callback later. Do not remove it on the grounds that
+    # it's currently redundant.
     lock = threading.Lock()
     # A completion queue (fed by add_done_callback) preserves actual completion
     # order, unlike concurrent.futures.wait()'s unordered `done` set -- needed
@@ -237,22 +235,35 @@ def _run_parallel(
                 future.add_done_callback(completed.put)
 
         submit_ready()
-        while pending:
-            future = completed.get()
-            node = pending.pop(future)
-            if future.cancelled():
-                continue
-            exc = future.exception()
-            if exc is not None:
-                failures.append((node, exc))
-                for other in pending:
-                    other.cancel()
-                continue
-            with lock:
-                _finish_node(node, future.result(), plan, cache, counts, root)
-            sorter.done(node)
-            if not failures:
+        try:
+            while pending:
+                future = completed.get()
+                node = pending.pop(future)
+                if future.cancelled():
+                    continue
+                exc = future.exception()
+                if exc is not None:
+                    failures.append((node, exc))
+                    for other in pending:
+                        other.cancel()
+                    continue
+                if failures:
+                    continue  # already aborting -- drop the result, don't cache it
+                with lock:
+                    _finish_node(node, future.result(), plan, cache, counts, root)
+                sorter.done(node)
                 submit_ready()
+        except BaseException:
+            # An escape here (KeyboardInterrupt while blocked in completed.get(),
+            # or a bug elsewhere in the loop) would otherwise hit the `with`
+            # block's shutdown(wait=True) and block until every already-queued
+            # task finishes, even ones that never started. Cancel what we can
+            # (only not-yet-started futures are actually cancellable) before
+            # letting the exception propagate; this doesn't affect the normal
+            # failure path above, which always drains `pending` to empty first.
+            for pending_future in pending:
+                pending_future.cancel()
+            raise
 
     if failures:
         first_node, first_exc = failures[0]

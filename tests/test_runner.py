@@ -226,6 +226,52 @@ def test_max_workers_below_one_raises_before_any_work(tmp_path, max_workers):
     assert calls == {"a": 1}
 
 
+def test_escaping_exception_cancels_not_yet_started_futures(tmp_path, monkeypatch):
+    """Regression test: if an exception escapes the parallel completion loop
+    (e.g. KeyboardInterrupt, or a bug elsewhere), queued-but-not-yet-started
+    futures must be cancelled rather than left for the executor's shutdown to
+    run to completion. Previously, `with ThreadPoolExecutor(...)` would call
+    shutdown(wait=True) with nothing cancelled, so every queued leaf ran to
+    completion regardless of how early the exception fired.
+    """
+    n = 10
+    started: list[int] = []
+    started_lock = threading.Lock()
+
+    def make_leaf(i: int):
+        def f() -> pl.DataFrame:
+            with started_lock:
+                started.append(i)
+            time.sleep(0.15)
+            return pl.DataFrame({"v": [i]})
+
+        return f
+
+    def combine(**dep_dfs: pl.DataFrame) -> pl.DataFrame:
+        return pl.DataFrame({"v": [sum(df["v"][0] for df in dep_dfs.values())]})
+
+    leaves = {f"n{i}": Node(tmp_path / f"leaf{i}.parquet", make_leaf(i)) for i in range(n)}
+    root = Node(tmp_path / "root.parquet", combine, deps=leaves)
+
+    import moktan.runner as runner_module
+
+    original_finish_node = runner_module._finish_node
+    raised = {"flag": False}
+
+    def flaky_finish_node(*args: Any, **kwargs: Any) -> None:
+        if not raised["flag"]:
+            raised["flag"] = True
+            raise KeyboardInterrupt("simulated escape")
+        return original_finish_node(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module, "_finish_node", flaky_finish_node)
+
+    with pytest.raises(KeyboardInterrupt):
+        run(root, max_workers=2)
+
+    assert len(started) < n
+
+
 def test_multiple_parallel_failures_report_all_nodes(tmp_path):
     # Barrier forces all 4 leaf tasks to actually start (and be past the point
     # where ThreadPoolExecutor could still cancel them) before any of them

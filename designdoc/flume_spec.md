@@ -94,7 +94,7 @@ def run(
 
 - `CycleError(ValueError)`: 閉路検出時。閉路に含まれるノードの path 一覧をメッセージに含める。
 - `DuplicatePathError(ValueError)`: 異なるノードが同一 `path` を持つとき。
-- `PipelineError(RuntimeError)`: ノード実行の失敗。`node: Node` 属性と `__cause__` に元例外を持つ。複数ノードが並列に失敗した場合は最初の 1 件を raise し、残りは `__notes__` に path を追記する（ExceptionGroup は使わない。呼び出し側の except が煩雑になるため）。
+- `PipelineError(RuntimeError)`: ノード実行またはロードの失敗。`node: Node` 属性と `__cause__` に元例外を持つ。複数ノードが並列に失敗した場合は最初の 1 件を raise し、残りは `__notes__` に path を追記する（ExceptionGroup は使わない。呼び出し側の except が煩雑になるため）。
 
 ## 3. グラフ処理（graph.py）
 
@@ -125,6 +125,8 @@ def run(
 4. いずれかの dep について `dep.path.stat().st_mtime > n.path.stat().st_mtime`（前回実行以降に上流ファイルが手動更新/別プロセス更新されたケース）
 
 条件 3 があるため、条件 4 は「今回の run の外」で起きた変更の検出専用。mtime の分解能問題（同一秒内の連続書き込み）は条件 3 が吸収するので、`>=` でなく `>` でよい。
+
+既知の制約: 外部プロセスが `n` の書き込みと同一秒内（または mtime の分解能内）に `dep` を書き換えた場合、条件 4 はこれを検出できない（`>` を `>=` にすると通常実行のたびに恒久的な false-positive 再計算を招くため、この盲点は許容する）。Pass 1 は各ノードの mtime を訪問時点で 1 回だけ取得してメモ化するため、この盲点は「Pass 1 実行中の外部書き換え」にも同様に及ぶ。将来 `Node` に `version: str = ""` を足して判定に混ぜる拡張（§10 参照）が正道。
 
 再計算とならないノードは `pl.read_parquet(n.path)` でロードする。ただし **下流に再計算ノードが 1 つもない場合はロード自体を省略できる**。実装方針: 判定パスを 2 段に分ける。
 

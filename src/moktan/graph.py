@@ -1,4 +1,4 @@
-"""DAG collection, cycle / duplicate-path validation, toposort and consumer counting."""
+"""DAG collection, cycle / duplicate-path validation and toposort."""
 
 from __future__ import annotations
 
@@ -74,17 +74,6 @@ def _collect_nodes(root: Node) -> list[Node]:
     return order
 
 
-def consumer_counts(
-    nodes: Iterable[Node], predecessors: Mapping[Node, Iterable[Node]]
-) -> dict[Node, int]:
-    """出次数 (このノードを dep として参照するノード数) を ``nodes`` の範囲で計算する。"""
-    counts = {node: 0 for node in nodes}
-    for deps in predecessors.values():
-        for dep in deps:
-            counts[dep] += 1
-    return counts
-
-
 @dataclass(frozen=True)
 class Graph:
     order: list[Node]
@@ -96,7 +85,21 @@ class Graph:
         With no argument, schedules the full graph. Pass a node subset (e.g. the
         Pass 2 execution set) to get a sorter restricted to just those nodes and
         the edges between them -- nodes outside the subset are never yielded by
-        ``get_ready()``, so callers don't need to special-case them.
+        ``get_ready()``.
+
+        Precondition for subsets: no node in ``nodes`` may need the output of a
+        node outside ``nodes`` -- edges crossing the subset boundary are simply
+        dropped, so any ordering through an excluded node is not preserved. This
+        holds for Pass 2's ``plan.pass2`` (every dep of a recompute node is
+        itself in ``pass2``, by construction of ``Plan``) but is not safe for an
+        arbitrary caller-chosen subset.
+
+        Construction walks ``self.order`` rather than the subset directly, so
+        that ``TopologicalSorter``'s insertion order -- and therefore
+        ``get_ready()``'s tie-break order among same-depth nodes -- stays
+        deterministic across processes. Iterating a bare ``set``/``frozenset``
+        of ``Node`` would vary run to run, since ``Node`` hashes by identity
+        (object address).
 
         Cycles are already ruled out by ``build_graph``; the conversion below is a
         defensive net in case graphlib's own detection disagrees.
@@ -105,8 +108,10 @@ class Graph:
         if nodes is None:
             predecessors = self.predecessors
         else:
-            subset = nodes if isinstance(nodes, (set, frozenset)) else set(nodes)
-            predecessors = {node: self.predecessors[node] & subset for node in subset}
+            subset = frozenset(nodes)
+            predecessors = {
+                node: self.predecessors[node] & subset for node in self.order if node in subset
+            }
         ts: TopologicalSorter[Node] = TopologicalSorter(predecessors)
         try:
             ts.prepare()
