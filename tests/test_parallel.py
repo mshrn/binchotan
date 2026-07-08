@@ -33,6 +33,34 @@ def test_parallel_matches_sequential_wide_independent_nodes(tmp_path):
     assert seq_df.equals(par_df)
 
 
+def test_parallel_resume_with_stale_root_after_fresh_chain(tmp_path):
+    """Regression test: resuming a linear a -> b -> c chain where only the root
+    is missing must not stall the parallel scheduler. Previously, submit_ready
+    only iterated a single get_ready() snapshot, so marking the non-pass2 node
+    `a` done() unblocked `b` without ever fetching it, leaving `futures` empty
+    and run() crashing with KeyError instead of computing `c`.
+    """
+
+    def make_a() -> pl.DataFrame:
+        return pl.DataFrame({"x": [1]})
+
+    def make_b(a: pl.DataFrame) -> pl.DataFrame:
+        return a.with_columns((pl.col("x") + 1).alias("x"))
+
+    def make_c(b: pl.DataFrame) -> pl.DataFrame:
+        return b.with_columns((pl.col("x") + 1).alias("x"))
+
+    node_a = Node(tmp_path / "a.parquet", make_a)
+    node_b = Node(tmp_path / "b.parquet", make_b, deps={"a": node_a})
+    node_c = Node(tmp_path / "c.parquet", make_c, deps={"b": node_b})
+
+    run(node_c, max_workers=2)
+    node_c.path.unlink()
+
+    df = run(node_c, max_workers=2)
+    assert df["x"].to_list() == [3]
+
+
 def _make_node_fn(idx: int):
     def f(**dep_dfs: pl.DataFrame) -> pl.DataFrame:
         total = idx

@@ -38,7 +38,9 @@ def _collect_nodes(root: Node) -> list[Node]:
 
     Uses visiting/done coloring to detect cycles and a stack-based (non-recursive)
     walk to avoid RecursionError on deep DAGs. Also validates that no two distinct
-    nodes share a resolved output path.
+    nodes share a resolved output path. The returned order is already a valid
+    topological order: a node is appended only once every one of its deps is
+    ``done``, so no separate toposort pass over the result is needed.
     """
     paths: dict[Path, Node] = {}
     _register_path(paths, root)
@@ -88,13 +90,24 @@ class Graph:
     order: list[Node]
     predecessors: dict[Node, frozenset[Node]]
 
-    def sorter(self) -> TopologicalSorter[Node]:
-        """A fresh, prepared TopologicalSorter over the full graph.
+    def sorter(self, nodes: Iterable[Node] | None = None) -> TopologicalSorter[Node]:
+        """A fresh, prepared TopologicalSorter.
+
+        With no argument, schedules the full graph. Pass a node subset (e.g. the
+        Pass 2 execution set) to get a sorter restricted to just those nodes and
+        the edges between them -- nodes outside the subset are never yielded by
+        ``get_ready()``, so callers don't need to special-case them.
 
         Cycles are already ruled out by ``build_graph``; the conversion below is a
         defensive net in case graphlib's own detection disagrees.
         """
-        ts: TopologicalSorter[Node] = TopologicalSorter(self.predecessors)
+        predecessors: Mapping[Node, Iterable[Node]]
+        if nodes is None:
+            predecessors = self.predecessors
+        else:
+            subset = nodes if isinstance(nodes, (set, frozenset)) else set(nodes)
+            predecessors = {node: self.predecessors[node] & subset for node in subset}
+        ts: TopologicalSorter[Node] = TopologicalSorter(predecessors)
         try:
             ts.prepare()
         except _GraphlibCycleError as exc:  # pragma: no cover - guarded by build_graph
@@ -103,11 +116,7 @@ class Graph:
 
 
 def build_graph(root: Node) -> Graph:
-    """Collect and validate all nodes reachable from ``root``, then toposort them."""
+    """Collect and validate all nodes reachable from ``root``."""
     nodes = _collect_nodes(root)
     predecessors = {node: frozenset(node.deps.values()) for node in nodes}
-    try:
-        order = list(TopologicalSorter(predecessors).static_order())
-    except _GraphlibCycleError as exc:  # pragma: no cover - guarded by _collect_nodes
-        raise CycleError(str(exc)) from exc
-    return Graph(order=order, predecessors=predecessors)
+    return Graph(order=nodes, predecessors=predecessors)
