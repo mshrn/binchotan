@@ -168,20 +168,39 @@ def test_resume_after_failure_skips_upstream_successes(tmp_path):
     assert calls == {"a": 1, "b": 2}
 
 
+def _verbs_by_path(caplog: pytest.LogCaptureFixture) -> dict[str, list[str]]:
+    verbs: dict[str, list[str]] = {}
+    for record in caplog.records:
+        verb, path = record.getMessage().split()[:2]
+        verbs.setdefault(path, []).append(verb)
+    return verbs
+
+
 @pytest.mark.parametrize("max_workers", [1, 2])
-def test_skipped_node_is_logged_exactly_once(tmp_path, caplog, max_workers):
+def test_each_node_logs_exactly_one_line(tmp_path, caplog, max_workers):
+    """spec §8: every node logs exactly one computed/loaded/skipped line, on
+    both the fresh-root early-return path and the partial-resume path."""
     node_a, node_b, node_c, calls = _linear_three(tmp_path)
     run(node_c)
     assert calls == {"a": 1, "b": 1, "c": 1}
 
+    with caplog.at_level("INFO", logger="moktan"):
+        run(node_c, max_workers=max_workers)
+    assert _verbs_by_path(caplog) == {
+        str(node_a.path): ["skipped"],
+        str(node_b.path): ["skipped"],
+        str(node_c.path): ["loaded"],
+    }
+
+    caplog.clear()
     node_c.path.unlink()
     with caplog.at_level("INFO", logger="moktan"):
         run(node_c, max_workers=max_workers)
-
-    skip_lines = [
-        record.getMessage() for record in caplog.records if "skipped" in record.getMessage()
-    ]
-    assert skip_lines.count(f"skipped {node_a.path}") == 1
+    assert _verbs_by_path(caplog) == {
+        str(node_a.path): ["skipped"],
+        str(node_b.path): ["loaded"],
+        str(node_c.path): ["computed"],
+    }
 
 
 @pytest.mark.parametrize("max_workers", [0, -1])
@@ -194,9 +213,17 @@ def test_max_workers_below_one_raises_before_any_work(tmp_path, max_workers):
 
     node_a = Node(tmp_path / "a.parquet", make_a)
 
+    # stale root: must raise before Pass 1 runs anything
     with pytest.raises(ValueError):
         run(node_a, max_workers=max_workers)
     assert calls == {"a": 0}
+
+    # fresh root: must raise too, not silently succeed via the early return
+    run(node_a)
+    assert calls == {"a": 1}
+    with pytest.raises(ValueError):
+        run(node_a, max_workers=max_workers)
+    assert calls == {"a": 1}
 
 
 def test_multiple_parallel_failures_report_all_nodes(tmp_path):
@@ -228,8 +255,6 @@ def test_multiple_parallel_failures_report_all_nodes(tmp_path):
     err = exc_info.value
     assert err.node in bad_nodes
     assert isinstance(err.__cause__, RuntimeError)
-    failed_paths = {str(node.path) for node in bad_nodes}
-    reported_paths = {str(err.node.path)} | {
-        note.removeprefix("also failed: ") for note in err.__notes__
+    assert set(err.__notes__) == {
+        f"also failed: {node.path}" for node in bad_nodes if node is not err.node
     }
-    assert reported_paths == failed_paths

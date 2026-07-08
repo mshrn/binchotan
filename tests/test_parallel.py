@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import polars as pl
+import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -33,12 +34,14 @@ def test_parallel_matches_sequential_wide_independent_nodes(tmp_path):
     assert seq_df.equals(par_df)
 
 
-def test_parallel_resume_with_stale_root_after_fresh_chain(tmp_path):
+@pytest.mark.parametrize("max_workers", [1, 2])
+def test_resume_with_stale_root_after_fresh_chain(tmp_path, max_workers):
     """Regression test: resuming a linear a -> b -> c chain where only the root
-    is missing must not stall the parallel scheduler. Previously, submit_ready
-    only iterated a single get_ready() snapshot, so marking the non-pass2 node
-    `a` done() unblocked `b` without ever fetching it, leaving `futures` empty
-    and run() crashing with KeyError instead of computing `c`.
+    is missing must not stall the scheduler. Previously, in the parallel path,
+    submit_ready only iterated a single get_ready() snapshot, so marking the
+    non-pass2 node `a` done() unblocked `b` without ever fetching it, leaving
+    `futures` empty and run() crashing with KeyError instead of computing `c`.
+    The sequential leg guards the same topology through the subgraph sorter.
     """
 
     def make_a() -> pl.DataFrame:
@@ -54,10 +57,10 @@ def test_parallel_resume_with_stale_root_after_fresh_chain(tmp_path):
     node_b = Node(tmp_path / "b.parquet", make_b, deps={"a": node_a})
     node_c = Node(tmp_path / "c.parquet", make_c, deps={"b": node_b})
 
-    run(node_c, max_workers=2)
+    run(node_c, max_workers=max_workers)
     node_c.path.unlink()
 
-    df = run(node_c, max_workers=2)
+    df = run(node_c, max_workers=max_workers)
     assert df["x"].to_list() == [3]
 
 
