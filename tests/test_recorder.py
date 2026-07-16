@@ -9,23 +9,12 @@ import logging
 import polars as pl
 import pytest
 
+from conftest import four_node_dag as _four_node_dag
 from moktan.events import RunContext, _emit
 from moktan.node import Node
 from moktan.recorder import RunRecorder
 
 RUN_ID = "7f3a1c9e2b04"
-
-
-def _four_node_dag(tmp_path):
-    users_raw = Node(tmp_path / "users_raw.parquet", lambda **_: pl.DataFrame())
-    orders_raw = Node(tmp_path / "orders_raw.parquet", lambda **_: pl.DataFrame())
-    orders_clean = Node(tmp_path / "orders_clean.parquet", lambda **_: pl.DataFrame(), deps={"orders": orders_raw})
-    joined = Node(
-        tmp_path / "joined.parquet",
-        lambda **_: pl.DataFrame(),
-        deps={"users": users_raw, "orders": orders_clean},
-    )
-    return users_raw, orders_raw, orders_clean, joined
 
 
 def _emit_planned(ctx, node, decision, reason, deps):

@@ -23,7 +23,7 @@ def test_memory_released_after_execution(tmp_path, max_workers):
     node_c = Node(tmp_path / "c.parquet", make_c, deps={"a": node_a, "b": node_b})
 
     graph = build_graph(node_c)
-    plan = _plan(graph, force=True)
+    plan = _plan(graph, node_c, force=True)
 
     ctx = RunContext(run_id="test")
     cache = _execute_pass2(ctx, graph, plan, node_c, max_workers=max_workers)

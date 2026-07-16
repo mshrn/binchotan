@@ -5,6 +5,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from conftest import linear_three as _linear_three
 from moktan import Node, run
 
 
@@ -44,18 +45,7 @@ def test_resume_with_stale_root_after_fresh_chain(tmp_path, max_workers):
     The sequential leg guards the same topology through the subgraph sorter.
     """
 
-    def make_a() -> pl.DataFrame:
-        return pl.DataFrame({"x": [1]})
-
-    def make_b(a: pl.DataFrame) -> pl.DataFrame:
-        return a.with_columns((pl.col("x") + 1).alias("x"))
-
-    def make_c(b: pl.DataFrame) -> pl.DataFrame:
-        return b.with_columns((pl.col("x") + 1).alias("x"))
-
-    node_a = Node(tmp_path / "a.parquet", make_a)
-    node_b = Node(tmp_path / "b.parquet", make_b, deps={"a": node_a})
-    node_c = Node(tmp_path / "c.parquet", make_c, deps={"b": node_b})
+    _node_a, _node_b, node_c, _calls = _linear_three(tmp_path)
 
     run(node_c, max_workers=max_workers)
     node_c.path.unlink()

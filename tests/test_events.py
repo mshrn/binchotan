@@ -132,6 +132,39 @@ def test_node_failed_console_line_quotes_message_with_spaces(caplog_moktan, ctx,
     )
 
 
+def test_node_failed_console_line_escapes_quotes_and_newlines_in_message(caplog_moktan, ctx, tmp_path):
+    """§1.6 (rev3): embedded `"` or newlines in a free-form field (e.g. an
+    exception message) must not break the one-event-one-line console
+    contract or produce unbalanced quoting."""
+    node = Node(tmp_path / "orders_clean.parquet", lambda: pl.DataFrame())
+    _emit(
+        ctx,
+        "node_failed",
+        logging.ERROR,
+        node=node,
+        error="RuntimeError",
+        message='unexpected "null"\nin order_id',
+    )
+    message = _sole_message(caplog_moktan)
+    assert "\n" not in message
+    assert message == (
+        f"node_failed node={node.path} error=RuntimeError "
+        f'message="unexpected \\"null\\"\\nin order_id" '
+        f"thread=MainThread run_id={ctx.run_id}"
+    )
+
+
+def test_console_value_quoted_when_it_contains_bare_equals(caplog_moktan, ctx, tmp_path):
+    """A value containing `=` unquoted would look like an extra key=value
+    pair to a naive parser."""
+    node = Node(tmp_path / "a.parquet", lambda: pl.DataFrame())
+    _emit(ctx, "node_failed", logging.ERROR, node=node, error="ValueError", message="a=b")
+    assert _sole_message(caplog_moktan) == (
+        f'node_failed node={node.path} error=ValueError message="a=b" '
+        f"thread=MainThread run_id={ctx.run_id}"
+    )
+
+
 def test_run_failed_console_line_renders_failed_list_as_repr(caplog_moktan, ctx):
     _emit(
         ctx,
@@ -263,6 +296,32 @@ def test_configure_logging_json_lines_output(tmp_path, ctx):
     assert payload["run_id"] == ctx.run_id
 
 
+def test_configure_logging_is_idempotent(tmp_path, ctx):
+    """§1.5 (rev3): calling configure_logging() twice must replace, not
+    stack, handlers -- otherwise every event prints/writes N times."""
+    from moktan.events import configure_logging
+
+    json_path = tmp_path / "moktan.jsonl"
+    logger = logging.getLogger("moktan")
+    try:
+        configure_logging(json_path=json_path, console=False)
+        configure_logging(json_path=json_path, console=False)  # re-configure, same target
+        assert len(logger.handlers) == 1
+
+        node = Node(tmp_path / "a.parquet", lambda: pl.DataFrame())
+        _emit(ctx, "node_computed", logging.INFO, node=node, duration_s=0.1, rows=1, columns=1, bytes=1)
+        for handler in logger.handlers:
+            handler.flush()
+
+        lines = json_path.read_text().strip().splitlines()
+        assert len(lines) == 1  # not 2
+    finally:
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            handler.close()
+        logger.setLevel(logging.NOTSET)
+
+
 def test_library_is_silent_without_configure_logging(capsys, ctx, tmp_path):
     """No configure_logging() call, no app handlers -> no stdout/stderr output."""
     node = Node(tmp_path / "a.parquet", lambda: pl.DataFrame())
@@ -270,3 +329,51 @@ def test_library_is_silent_without_configure_logging(capsys, ctx, tmp_path):
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == ""
+
+
+def test_library_is_silent_for_error_level_events_too(tmp_path):
+    """Without a handler, WARNING+ records (node_failed/run_failed are ERROR)
+    must not fall through to logging.lastResort and print to stderr -- that's
+    what makes "no handler configured" actually mean "silent" (§1, §9-10).
+
+    Run in a subprocess: pytest's own logging plugin keeps at least one
+    handler attached to the root logger for the whole session, which means
+    `logging.lastResort` never fires inside the test process regardless of
+    whether moktan's NullHandler fix is present -- capsys alone cannot catch
+    this class of regression. A subprocess inherits the real OS-level stderr,
+    unaffected by pytest's capture.
+    """
+    import subprocess
+    import sys
+
+    script = (
+        "from moktan.events import RunContext, _emit\n"
+        "import logging\n"
+        "ctx = RunContext(run_id='deadbeefcafe')\n"
+        "_emit(ctx, 'node_failed', logging.ERROR, error='RuntimeError', message='boom')\n"
+        "_emit(ctx, 'run_failed', logging.ERROR, status='failed', duration_s=0.1, failed=[])\n"
+    )
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+    assert result.stdout == ""
+    assert result.stderr == ""
+
+
+def test_structlog_global_config_does_not_affect_moktan(caplog_moktan, ctx, tmp_path):
+    """§1: moktan's wrapped logger must be independent of an application's own
+    structlog.configure() -- both the "DEBUG events silently vanish" and the
+    "every _emit crashes" failure modes are real without wrapper_class/
+    context_class pinned explicitly (reproduced against structlog 26.1)."""
+    import structlog
+
+    node = Node(tmp_path / "x.parquet", lambda: pl.DataFrame())
+    for wrapper_class in (
+        structlog.make_filtering_bound_logger(logging.INFO),
+        structlog.BoundLogger,
+    ):
+        structlog.configure(wrapper_class=wrapper_class)
+        try:
+            caplog_moktan.clear()
+            _emit(ctx, "node_planned", logging.DEBUG, node=node, decision="compute", reason="missing", deps=[])
+            assert len(caplog_moktan.records) == 1, wrapper_class
+        finally:
+            structlog.reset_defaults()

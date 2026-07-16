@@ -11,16 +11,12 @@ from dataclasses import dataclass
 from graphlib import TopologicalSorter
 from pathlib import Path
 from queue import SimpleQueue
-from typing import Literal
 
 import polars as pl
 
-from moktan.events import RunContext, _emit, new_run_id
+from moktan.events import Decision, Reason, RunContext, _emit, new_run_id
 from moktan.graph import Graph, build_graph
 from moktan.node import Node
-
-Reason = Literal["missing", "forced", "dep_stale", "dep_newer", "fresh"]
-Decision = Literal["compute", "load", "skip"]
 
 
 class PipelineError(RuntimeError):
@@ -59,59 +55,62 @@ def run(root: Node, *, force: bool = False, max_workers: int = 1) -> pl.DataFram
     merely loaded; everything else is (re)computed and atomically written.
     Emits the structured event stream described in
     designdoc/flume_logging_spec.md §3 -- see that spec for the full event
-    catalogue and console/JSON Lines formats.
+    catalogue and console/JSON Lines formats. ``run_started`` always pairs
+    with exactly one of ``run_finished`` / ``run_failed`` (§8): graph
+    validation happens before ``run_started`` is emitted (a bad DAG means the
+    run never started, so it gets no events at all), and everything from
+    ``run_started`` onward is wrapped so any exception -- not just
+    ``PipelineError`` -- still closes the run with ``run_failed``.
     """
     if max_workers < 1:
         raise ValueError(f"max_workers must be >= 1, got {max_workers}")
+
+    graph = build_graph(root)  # CycleError/DuplicatePathError here: run never started, no events
 
     ctx = RunContext(run_id=new_run_id())
     start = time.perf_counter()
     _emit(ctx, "run_started", logging.INFO, root=str(root.path), force=force, max_workers=max_workers)
 
-    graph = build_graph(root)
-    plan_start = time.perf_counter()
-    plan = _plan(graph, force=force)
-    plan_duration = time.perf_counter() - plan_start
+    try:
+        plan_start = time.perf_counter()
+        plan = _plan(graph, root, force=force)
+        plan_duration = time.perf_counter() - plan_start
 
-    decisions = {node: _decision(node, root, plan) for node in graph.order}
-    n_compute = sum(1 for d in decisions.values() if d == "compute")
-    n_load = sum(1 for d in decisions.values() if d == "load")
-    n_skip = len(graph.order) - n_compute - n_load
-    _emit(
-        ctx,
-        "plan_computed",
-        logging.INFO,
-        n_nodes=len(graph.order),
-        n_compute=n_compute,
-        n_load=n_load,
-        n_skip=n_skip,
-        duration_s=plan_duration,
-    )
-
-    for node in graph.order:
+        decisions = {node: _decision(node, plan) for node in graph.order}
+        n_compute = sum(1 for d in decisions.values() if d == "compute")
+        n_load = sum(1 for d in decisions.values() if d == "load")
+        n_skip = len(graph.order) - n_compute - n_load
         _emit(
             ctx,
-            "node_planned",
-            logging.DEBUG,
-            node=node,
-            decision=decisions[node],
-            reason=plan.reasons[node],
-            deps=[str(dep.path) for dep in node.deps.values()],
+            "plan_computed",
+            logging.INFO,
+            n_nodes=len(graph.order),
+            n_compute=n_compute,
+            n_load=n_load,
+            n_skip=n_skip,
+            duration_s=plan_duration,
         )
 
-    for node in graph.order:
-        if decisions[node] == "skip":
-            _emit(ctx, "node_skipped", logging.INFO, node=node)
+        for node in graph.order:
+            _emit(
+                ctx,
+                "node_planned",
+                logging.DEBUG,
+                node=node,
+                decision=decisions[node],
+                reason=plan.reasons[node],
+                deps=[str(dep.path) for dep in node.deps.values()],
+            )
 
-    try:
-        if not plan.needs_compute[root]:
-            try:
-                df = _compute_or_load(ctx, root, False, {})
-            except Exception as exc:
-                raise PipelineError(root) from exc
-        else:
-            cache = _execute_pass2(ctx, graph, plan, root, max_workers=max_workers)
-            df = cache[root]
+        for node in graph.order:
+            if decisions[node] == "skip":
+                _emit(ctx, "node_skipped", logging.INFO, node=node)
+
+        # root always ends up in plan.pass2 (see _plan), so it's always
+        # handled by the normal Pass 2 machinery -- including node_failed
+        # emission on a load failure. No separate fresh-root shortcut.
+        cache = _execute_pass2(ctx, graph, plan, root, max_workers=max_workers)
+        df = cache[root]
     except PipelineError as exc:
         _emit(
             ctx,
@@ -120,6 +119,21 @@ def run(root: Node, *, force: bool = False, max_workers: int = 1) -> pl.DataFram
             status="failed",
             duration_s=time.perf_counter() - start,
             failed=[str(n.path) for n in exc.failed],
+        )
+        raise
+    except BaseException as exc:
+        # Anything other than PipelineError (a bug in _plan, an OSError from
+        # stat(), KeyboardInterrupt, ...): still close the run so run_started
+        # never dangles unpaired (§8).
+        _emit(
+            ctx,
+            "run_failed",
+            logging.ERROR,
+            status="failed",
+            duration_s=time.perf_counter() - start,
+            failed=[],
+            error=type(exc).__name__,
+            message=str(exc),
         )
         raise
 
@@ -136,28 +150,34 @@ def run(root: Node, *, force: bool = False, max_workers: int = 1) -> pl.DataFram
     return df
 
 
-def _decision(node: Node, root: Node, plan: Plan) -> Decision:
+def _decision(node: Node, plan: Plan) -> Decision:
     if node in plan.recompute:
         return "compute"
-    if node in plan.pass2 or node is root:
-        # A fresh root is never in pass2 (it has no consumers to be a load
-        # target for) but the fresh-root shortcut in run() always loads it.
+    if node in plan.pass2:
         return "load"
     return "skip"
 
 
-def _plan(graph: Graph, *, force: bool) -> Plan:
+def _plan(graph: Graph, root: Node, *, force: bool) -> Plan:
     reasons = _determine_stale(graph, force=force)
     needs_compute = {node: reason != "fresh" for node, reason in reasons.items()}
     recompute = frozenset(node for node in graph.order if needs_compute[node])
-    load_targets = (
+    load_targets = {
         dep for node in recompute for dep in node.deps.values() if not needs_compute[dep]
-    )
+    }
+    pass2 = recompute | load_targets
+    if root not in pass2:
+        # root has no consumers (it's the sink), so it can never be a load
+        # target for anything else -- but a fresh root must still be loaded
+        # and returned. Folding it into pass2 here means run() has exactly
+        # one execution path (_execute_pass2) instead of a separate
+        # fresh-root shortcut that would need its own node_failed handling.
+        pass2 = pass2 | {root}
     return Plan(
         needs_compute=needs_compute,
         reasons=reasons,
         recompute=recompute,
-        pass2=recompute.union(load_targets),
+        pass2=frozenset(pass2),
     )
 
 
@@ -206,6 +226,17 @@ def _atomic_write(path: Path, df: pl.DataFrame) -> None:
         raise
 
 
+def _file_size(path: Path) -> int | None:
+    try:
+        return path.stat().st_size
+    except OSError:
+        # Best-effort: the write already succeeded (checkpoint is durable on
+        # disk) by the time this runs. A stat failure here (external removal,
+        # a flaky network FS) shouldn't turn a successful compute into a
+        # node_failed/PipelineError -- report the size as unknown instead.
+        return None
+
+
 def _compute_or_load(
     ctx: RunContext, node: Node, needs_compute_flag: bool, kwargs: dict[str, pl.DataFrame]
 ) -> pl.DataFrame:
@@ -221,7 +252,7 @@ def _compute_or_load(
             duration_s=time.perf_counter() - start,
             rows=df.height,
             columns=df.width,
-            bytes=node.path.stat().st_size,
+            bytes=_file_size(node.path),
         )
     else:
         start = time.perf_counter()
@@ -247,7 +278,10 @@ def _execute_pass2(
     counts = Counter(dep for node in plan.recompute for dep in node.deps.values())
     cache: dict[Node, pl.DataFrame] = {}
 
-    if max_workers == 1:
+    # No point spinning up a ThreadPoolExecutor when there's nothing to
+    # compute (e.g. the all-fresh resume case, where pass2 is just {root}
+    # being loaded) -- go sequential regardless of max_workers.
+    if max_workers == 1 or not plan.recompute:
         _run_sequential(ctx, sorter, plan, cache, counts, root)
     else:
         _run_parallel(ctx, sorter, plan, cache, counts, root, max_workers)

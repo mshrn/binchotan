@@ -93,6 +93,13 @@ def _transitive_deps(dep_indices: DagSpec, v: int) -> set[int]:
 
 
 class _ListHandler(logging.Handler):
+    """Deliberately goes through the real stdlib logging path (unlike
+    RunRecorder, which receives events directly via moktan.events._dispatch,
+    bypassing logging entirely) -- this is what actually exercises
+    structlog's wrap_logger + _render_console_message + the level gate, which
+    is the thing PBT here wants to hammer with random DAGs. RunRecorder would
+    only re-test the dispatch path already covered by test_recorder.py."""
+
     def __init__(self) -> None:
         super().__init__()
         self.events: list[dict] = []
@@ -241,7 +248,7 @@ def test_cache_holds_only_root_after_pass2(tmp_path_factory, spec, delete_seed, 
         nodes[i].path.unlink()
 
     graph = build_graph(root)
-    plan = _plan(graph, force=False)
+    plan = _plan(graph, root, force=False)
     assume(plan.needs_compute[root])
 
     ctx = RunContext(run_id="test")

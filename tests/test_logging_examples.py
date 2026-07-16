@@ -5,6 +5,7 @@ timing-dependent), the assertions check structural/count invariants instead
 of exact sequences.
 """
 
+import json
 import logging
 import os
 import re
@@ -13,34 +14,9 @@ import time
 import polars as pl
 import pytest
 
+from conftest import four_node_dag as _four_node_dag
 from conftest import moktan_event
 from moktan import Node, PipelineError, RunRecorder, run
-
-
-def _four_node_dag(tmp_path):
-    """§12.1-12.2/12.5-12.7's DAG: users_raw, orders_raw -> orders_clean -> joined."""
-
-    def make_users_raw() -> pl.DataFrame:
-        return pl.DataFrame({"id": range(500), "name": ["u"] * 500, "email": ["e"] * 500})
-
-    def make_orders_raw() -> pl.DataFrame:
-        return pl.DataFrame({"id": range(1200), "user_id": [1] * 1200, "amount": [1] * 1200, "d": [1] * 1200})
-
-    def make_orders_clean(orders: pl.DataFrame) -> pl.DataFrame:
-        return orders.head(1180)
-
-    def make_joined(users: pl.DataFrame, orders: pl.DataFrame) -> pl.DataFrame:
-        return orders.with_columns(
-            pl.lit(1).alias("a"), pl.lit(1).alias("b"), pl.lit(1).alias("c")
-        )
-
-    users_raw = Node(tmp_path / "users_raw.parquet", make_users_raw)
-    orders_raw = Node(tmp_path / "orders_raw.parquet", make_orders_raw)
-    orders_clean = Node(tmp_path / "orders_clean.parquet", make_orders_clean, deps={"orders": orders_raw})
-    joined = Node(
-        tmp_path / "joined.parquet", make_joined, deps={"users": users_raw, "orders": orders_clean}
-    )
-    return users_raw, orders_raw, orders_clean, joined
 
 
 def _capture(caplog: pytest.LogCaptureFixture, level: int = logging.INFO):
@@ -56,11 +32,7 @@ def _by_event(events: list[dict], name: str) -> list[dict]:
     return [e for e in events if e["event"] == name]
 
 
-CONSOLE_LINE_RE = {
-    "computed": re.compile(r"^computed (?P<path>\S+) \((?P<dur>\d+\.\d{2})s\) (?P<kv>.+)$"),
-    "loaded": re.compile(r"^loaded (?P<path>\S+) \((?P<dur>\d+\.\d{2})s\) (?P<kv>.+)$"),
-    "skipped": re.compile(r"^skipped (?P<path>\S+) (?P<kv>.+)$"),
-}
+COMPUTED_LINE_RE = re.compile(r"^computed (?P<path>\S+) \((?P<dur>\d+\.\d{2})s\) (?P<kv>.+)$")
 
 
 def test_case_12_1_initial_full_run_sequential(tmp_path, caplog):
@@ -102,7 +74,7 @@ def test_case_12_1_initial_full_run_sequential(tmp_path, caplog):
 
     # console line shape matches §6.1/§12.1 exactly (verb, path, duration, kv tail)
     joined_record = next(r for r in caplog.records if moktan_event(r) is joined_computed)
-    m = CONSOLE_LINE_RE["computed"].match(joined_record.getMessage())
+    m = COMPUTED_LINE_RE.match(joined_record.getMessage())
     assert m is not None
     assert m.group("path") == str(joined.path)
     assert f"run_id={run_id}" in m.group("kv")
@@ -359,3 +331,172 @@ def test_run_recorder_end_to_end_matches_manual_events(tmp_path):
     report = recorder.to_markdown()
     assert "status: ok" in report
     assert mermaid in report
+
+
+def test_fresh_root_load_failure_emits_node_failed(tmp_path, caplog):
+    """§1.2 (rev3): a corrupted-but-fresh root must go through the normal
+    node_failed path, not just run_failed -- otherwise RunRecorder's Failure
+    section has nowhere to pull error/message from."""
+    _capture(caplog, level=logging.DEBUG)
+
+    node = Node(tmp_path / "root.parquet", lambda: pl.DataFrame({"x": [1]}))
+    run(node, max_workers=1)  # write a real, valid parquet once
+    node.path.write_bytes(b"not a parquet file")  # corrupt it in place, mtime unchanged
+
+    caplog.clear()
+    recorder = RunRecorder()
+    with recorder.attach(), pytest.raises(PipelineError) as exc_info:
+        run(node, max_workers=1)
+    assert exc_info.value.node is node
+    assert exc_info.value.failed == [node]
+
+    events = _events(caplog)
+    planned = _by_event(events, "node_planned")[0]
+    assert planned["decision"] == "load"
+    assert planned["reason"] == "fresh"
+
+    failed = _by_event(events, "node_failed")
+    assert len(failed) == 1
+    assert failed[0]["node"] == str(node.path)
+
+    run_failed = _by_event(events, "run_failed")[0]
+    assert run_failed["failed"] == [str(node.path)]
+
+    report = recorder.to_markdown()
+    assert "## Failure" in report
+    assert str(node.path) in report
+
+
+def test_run_started_pairs_with_run_failed_even_for_non_pipeline_error(tmp_path, caplog, monkeypatch):
+    """§1.3 (rev3): an exception that isn't PipelineError (simulated here by
+    monkeypatching _plan to raise) still closes the run with run_failed, so
+    run_started never dangles unpaired."""
+    import moktan.runner as runner_module
+
+    _capture(caplog)
+    node = Node(tmp_path / "x.parquet", lambda: pl.DataFrame({"x": [1]}))
+
+    def broken_plan(graph: object, root: object, *, force: bool) -> object:
+        raise OSError("simulated permission error")
+
+    monkeypatch.setattr(runner_module, "_plan", broken_plan)
+    with pytest.raises(OSError):
+        run(node, max_workers=1)
+
+    events = _events(caplog)
+    assert [e["event"] for e in events] == ["run_started", "run_failed"]
+    assert events[1]["error"] == "OSError"
+    assert events[1]["message"] == "simulated permission error"
+    assert events[1]["failed"] == []
+
+
+def test_graph_validation_error_emits_no_events_at_all(tmp_path, caplog):
+    """§1.3 (rev3): a cyclic DAG fails before run_started is ever emitted --
+    graph validation isn't part of "the run" (no dangling run_started)."""
+    from moktan import CycleError
+
+    _capture(caplog, level=logging.DEBUG)
+
+    def fa() -> pl.DataFrame:
+        return pl.DataFrame({"x": [1]})
+
+    def fb(x: pl.DataFrame) -> pl.DataFrame:
+        return x
+
+    a = Node(tmp_path / "a.parquet", fa)
+    b = Node(tmp_path / "b.parquet", fb, deps={"x": a})
+    object.__setattr__(a, "deps", {"x": b})
+
+    with pytest.raises(CycleError):
+        run(b)
+
+    assert _events(caplog) == []
+
+
+def test_failing_run_is_silent_without_configure_logging(tmp_path):
+    """§1.4/§9-10: a run() that FAILS (node_failed/run_failed are ERROR) must
+    stay silent absent configure_logging()/an app handler. Run in a
+    subprocess -- pytest's own logging plugin keeps a handler attached to the
+    root logger for the whole session, so logging.lastResort never fires
+    inside the test process itself; capsys can't observe this regression
+    class (see tests/test_events.py::test_library_is_silent_for_error_level_events_too)."""
+    import subprocess
+    import sys
+
+    script = (
+        "from moktan import Node, PipelineError, run\n"
+        "def make_bad():\n"
+        "    raise RuntimeError('boom')\n"
+        f"node = Node(__import__('pathlib').Path({str(tmp_path / 'bad.parquet')!r}), make_bad)\n"
+        "try:\n"
+        "    run(node, max_workers=1)\n"
+        "except PipelineError:\n"
+        "    pass\n"
+    )
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+    assert result.stdout == ""
+    assert result.stderr == ""
+
+
+def test_run_id_consistent_across_max_workers_4_and_differs_between_runs(tmp_path, caplog):
+    """§9-2 (verbatim): with max_workers=4, every event (including ones
+    emitted from worker threads) shares one run_id; two consecutive run()
+    calls get different run_ids."""
+    _capture(caplog)
+    leaves = {f"n{i}": Node(tmp_path / f"leaf{i}.parquet", (lambda i=i: pl.DataFrame({"v": [i]}))) for i in range(4)}
+    combined = Node(
+        tmp_path / "combined.parquet",
+        lambda **dep_dfs: pl.DataFrame({"v": [sum(df["v"][0] for df in dep_dfs.values())]}),
+        deps=leaves,
+    )
+
+    run(combined, max_workers=4)
+    first_run_ids = {e["run_id"] for e in _events(caplog)}
+    assert len(first_run_ids) == 1  # every event this run agrees, incl. worker-thread ones
+
+    caplog.clear()
+    run(combined, max_workers=4)
+    second_run_ids = {e["run_id"] for e in _events(caplog)}
+    assert len(second_run_ids) == 1
+    assert first_run_ids != second_run_ids  # consecutive runs never reuse a run_id
+
+
+def test_jsonl_event_count_matches_console_event_count(tmp_path, caplog):
+    """§9-7 (latter half, previously untested): the JSON Lines sink and the
+    console sink must see the same number of events for the same run."""
+    from moktan.events import configure_logging
+
+    _capture(caplog)
+    users_raw, orders_raw, orders_clean, joined = _four_node_dag(tmp_path)
+
+    json_path = tmp_path / "moktan.jsonl"
+    configure_logging(json_path=json_path, console=False)
+    try:
+        run(joined, max_workers=1)
+        for handler in logging.getLogger("moktan").handlers:
+            handler.flush()
+    finally:
+        logger = logging.getLogger("moktan")
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            handler.close()
+        logger.setLevel(logging.NOTSET)
+
+    console_events = _events(caplog)
+    jsonl_lines = json_path.read_text().strip().splitlines()
+    assert len(jsonl_lines) == len(console_events)
+    for line in jsonl_lines:
+        json.loads(line)  # each line independently parses
+
+
+def test_write_report_round_trips_to_markdown(tmp_path):
+    """§7/§11 step 2 (previously untested): write_report(path) writes exactly
+    what to_markdown() returns."""
+    users_raw, orders_raw, orders_clean, joined = _four_node_dag(tmp_path)
+    recorder = RunRecorder()
+    with recorder.attach():
+        run(joined, max_workers=1)
+
+    report_path = tmp_path / "report.md"
+    recorder.write_report(report_path)
+    assert report_path.read_text() == recorder.to_markdown()

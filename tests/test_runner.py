@@ -7,29 +7,9 @@ from typing import Any
 import polars as pl
 import pytest
 
+from conftest import linear_three as _linear_three
 from conftest import moktan_event
 from moktan import Node, PipelineError, run
-
-
-def _linear_three(tmp_path: Path) -> tuple[Node, Node, Node, dict[str, int]]:
-    calls = {"a": 0, "b": 0, "c": 0}
-
-    def make_a() -> pl.DataFrame:
-        calls["a"] += 1
-        return pl.DataFrame({"x": [1]})
-
-    def make_b(a: pl.DataFrame) -> pl.DataFrame:
-        calls["b"] += 1
-        return a.with_columns((pl.col("x") + 1).alias("x"))
-
-    def make_c(b: pl.DataFrame) -> pl.DataFrame:
-        calls["c"] += 1
-        return b.with_columns((pl.col("x") + 1).alias("x"))
-
-    node_a = Node(tmp_path / "a.parquet", make_a)
-    node_b = Node(tmp_path / "b.parquet", make_b, deps={"a": node_a})
-    node_c = Node(tmp_path / "c.parquet", make_c, deps={"b": node_b})
-    return node_a, node_b, node_c, calls
 
 
 def test_linear_three_nodes_recompute_then_skip(tmp_path):
@@ -233,6 +213,36 @@ def test_max_workers_below_one_raises_before_any_work(tmp_path, max_workers):
     with pytest.raises(ValueError):
         run(node_a, max_workers=max_workers)
     assert calls == {"a": 1}
+
+
+def test_file_size_returns_none_on_stat_failure(tmp_path):
+    """§2.5 (rev3): _file_size() swallows OSError instead of propagating it."""
+    import moktan.runner as runner_module
+
+    assert runner_module._file_size(tmp_path / "does_not_exist.parquet") is None
+
+
+def test_stat_failure_after_successful_write_does_not_fail_the_node(tmp_path, monkeypatch, caplog):
+    """§2.5 (rev3): if the post-write size lookup can't determine a size
+    (external removal, flaky network FS), that must not turn an already-
+    successful compute into a node_failed/PipelineError -- the checkpoint is
+    durable on disk regardless. node_computed still fires, with bytes=None.
+    """
+    import moktan.runner as runner_module
+
+    node = Node(tmp_path / "a.parquet", lambda: pl.DataFrame({"x": [1]}))
+    monkeypatch.setattr(runner_module, "_file_size", lambda path: None)
+
+    caplog.set_level("INFO", logger="moktan")
+    df = run(node)
+    assert df["x"].to_list() == [1]
+    assert node.path.exists()
+
+    computed = [
+        moktan_event(r) for r in caplog.records if moktan_event(r)["event"] == "node_computed"
+    ]
+    assert len(computed) == 1
+    assert computed[0]["bytes"] is None
 
 
 def test_escaping_exception_cancels_not_yet_started_futures(tmp_path, monkeypatch):

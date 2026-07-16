@@ -27,13 +27,35 @@ from collections.abc import MutableMapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import structlog
 
 from moktan.node import Node
 
+# --- event vocabulary (§3, §4) -----------------------------------------------
+# events.py is the single owner of the event schema: event names, their field
+# vocabulary, and the Literal types that classify specific fields. runner.py
+# and recorder.py import from here rather than each keeping their own copy,
+# so adding/renaming an event only requires editing one module.
+
+Reason = Literal["missing", "forced", "dep_stale", "dep_newer", "fresh"]
+Decision = Literal["compute", "load", "skip"]
+
+# Which events represent a node's terminal (one-per-node) outcome for a run,
+# per the §8 contract ("every reachable node gets exactly one of these, or
+# node_failed/node_cancelled on a failed run").
+TERMINAL_NODE_EVENTS = frozenset(
+    {"node_computed", "node_loaded", "node_skipped", "node_failed", "node_cancelled"}
+)
+
 logger = logging.getLogger("moktan")
+# Standard library etiquette for a library logger: without this, a record at
+# WARNING or above (e.g. node_failed/run_failed, both ERROR) falls through to
+# logging.lastResort and prints to stderr even when the application never
+# configured any handler -- breaking the "silent by default" contract (§1,
+# §9-10). NullHandler makes "no handler configured" mean what it says.
+logger.addHandler(logging.NullHandler())
 
 
 @dataclass(frozen=True)
@@ -62,13 +84,27 @@ _LEGACY_VERBS: dict[str, str] = {
 }
 
 
-def _format_value(key: str, value: object) -> str:
-    if key == "duration_s":
-        return f"{value:.2f}"
+def _format_duration(value: float) -> str:
+    return f"{value:.2f}"
+
+
+def _needs_quoting(value: str) -> bool:
+    # Any of these break the whitespace-delimited "key=value ..." tail (or,
+    # for `"`/newline, the "one event, one line" console contract itself) if
+    # left bare -- e.g. a node_failed message from `str(exc)`.
+    return any(c in value for c in (" ", '"', "\n", "="))
+
+
+def _format_value(value: object) -> str:
+    if isinstance(value, float):
+        # Dispatch on type, not the key name "duration_s": any future float
+        # field gets the same 2-decimal rendering instead of falling through
+        # to full-precision repr.
+        return _format_duration(value)
     if isinstance(value, list):
         return repr(value)
-    if isinstance(value, str) and " " in value:
-        return f'"{value}"'
+    if isinstance(value, str) and _needs_quoting(value):
+        return json.dumps(value)  # also escapes embedded `"` and newlines
     return str(value)
 
 
@@ -88,16 +124,28 @@ def _render_console_message(
         duration = rest.pop("duration_s", None)
         head = verb if node is None else f"{verb} {node}"
         if duration is not None:
-            head = f"{head} ({duration:.2f}s)"
+            head = f"{head} ({_format_duration(duration)}s)"
     else:
         head = event
 
-    tail = " ".join(f"{k}={_format_value(k, v)}" for k, v in rest.items())
+    tail = " ".join(f"{k}={_format_value(v)}" for k, v in rest.items())
     message = f"{head} {tail}" if tail else head
     return (message,), {"extra": {"moktan_event": raw}}
 
 
-_struct_logger = structlog.wrap_logger(logger, processors=[_render_console_message])
+_struct_logger = structlog.wrap_logger(
+    logger,
+    processors=[_render_console_message],
+    # Pinned explicitly: wrap_logger() falls back to the *application's*
+    # global structlog.configure() wrapper_class/context_class when these are
+    # omitted, breaking the "independent of global config" contract this
+    # module documents above. Left implicit, an app configuring e.g.
+    # make_filtering_bound_logger(INFO) silently drops moktan's DEBUG events,
+    # and an app configuring the generic structlog.BoundLogger crashes every
+    # _emit call (its .log() signature doesn't match ours).
+    wrapper_class=structlog.stdlib.BoundLogger,
+    context_class=dict,
+)
 
 
 # --- RunRecorder registry (§2, §7) ------------------------------------------
@@ -118,13 +166,13 @@ def _register(sink: _EventSink) -> None:
 
 def _unregister(sink: _EventSink) -> None:
     with _registry_lock:
-        # identity-based removal: RunRecorder is eq=False (like Node) so that
-        # two recorders with equal-by-value .events lists (e.g. both still
-        # empty) can never be confused with each other here.
-        for i, existing in enumerate(_registry):
-            if existing is sink:
-                del _registry[i]
-                return
+        # list.remove() uses __eq__, which must be identity-based here so two
+        # sinks with equal-by-value .events (e.g. both still empty) can never
+        # be confused with each other: RunRecorder is eq=False (like Node),
+        # and a plain class with no __eq__ override already gets identity
+        # equality from object. Any future _EventSink implementer must keep
+        # that property.
+        _registry.remove(sink)
 
 
 def _dispatch(event: dict[str, Any]) -> None:
@@ -140,6 +188,13 @@ def _dispatch(event: dict[str, Any]) -> None:
 def _emit(
     ctx: RunContext, event: str, level: int, *, node: Node | None = None, **fields: object
 ) -> None:
+    if not _registry and not logger.isEnabledFor(level):
+        # Nobody's listening: skip building the event dict, formatting the
+        # timestamp, and rendering the console string. structlog's processor
+        # chain runs *before* the stdlib level check, so without this the
+        # full render cost is paid (and thrown away) for every event on every
+        # run, even with logging fully unconfigured.
+        return
     ordered: dict[str, Any] = {"event": event}
     if node is not None:
         ordered["node"] = str(node.path)
@@ -153,15 +208,28 @@ def _emit(
     _struct_logger.log(level, event, **{k: v for k, v in ordered.items() if k != "event"})
 
 
+def moktan_event(record: logging.LogRecord) -> dict[str, Any] | None:
+    """Recover the full structured event dict moktan attached to a LogRecord
+    it emitted (the same dict handed to RunRecorder sinks). Returns ``None``
+    for a record moktan didn't emit. This is the one accessor for the
+    ``extra`` attribute ``_render_console_message`` sets -- used by
+    :class:`_JSONFormatter` and available for an application's own custom
+    formatter/handler (§6.2)."""
+    return getattr(record, "moktan_event", None)
+
+
 # --- configure_logging (§6.2) -------------------------------------------------
 
 
 class _JSONFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
-        event = getattr(record, "moktan_event", None)
+        event = moktan_event(record)
         if event is None:  # pragma: no cover - defensive, all our records set it
             return super().format(record)
         return json.dumps(event, default=str)
+
+
+_installed_handlers: list[logging.Handler] = []
 
 
 def configure_logging(
@@ -172,14 +240,26 @@ def configure_logging(
     Never called internally by moktan itself -- without this (or an
     application's own handler on the ``"moktan"`` logger), moktan stays
     silent (§9-10).
+
+    Idempotent: calling this again *replaces* the previous configuration
+    (removes and closes whatever handlers a prior call installed) rather than
+    stacking duplicate handlers, so re-running setup code (a notebook cell, a
+    module imported twice) doesn't multiply every log line.
     """
     target = logging.getLogger("moktan")
+    for handler in _installed_handlers:
+        target.removeHandler(handler)
+        handler.close()
+    _installed_handlers.clear()
+
     target.setLevel(level)
     if console:
-        handler: logging.Handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        target.addHandler(handler)
+        console_handler: logging.Handler = logging.StreamHandler()
+        console_handler.setFormatter(logging.Formatter("%(message)s"))
+        target.addHandler(console_handler)
+        _installed_handlers.append(console_handler)
     if json_path is not None:
-        json_handler = logging.FileHandler(json_path)
+        json_handler: logging.Handler = logging.FileHandler(json_path)
         json_handler.setFormatter(_JSONFormatter())
         target.addHandler(json_handler)
+        _installed_handlers.append(json_handler)
