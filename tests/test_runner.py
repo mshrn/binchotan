@@ -7,6 +7,7 @@ from typing import Any
 import polars as pl
 import pytest
 
+from conftest import moktan_event
 from moktan import Node, PipelineError, run
 
 
@@ -168,12 +169,20 @@ def test_resume_after_failure_skips_upstream_successes(tmp_path):
     assert calls == {"a": 1, "b": 2}
 
 
-def _verbs_by_path(caplog: pytest.LogCaptureFixture) -> dict[str, list[str]]:
-    verbs: dict[str, list[str]] = {}
+def _node_events_by_path(caplog: pytest.LogCaptureFixture) -> dict[str, list[str]]:
+    """Per-node INFO events (computed/loaded/skipped), keyed by node path.
+
+    Reads the structured event dict moktan attaches to each LogRecord (see
+    moktan.events._render_console_message), not the rendered message text, so
+    this is robust to console-format changes.
+    """
+    events: dict[str, list[str]] = {}
     for record in caplog.records:
-        verb, path = record.getMessage().split()[:2]
-        verbs.setdefault(path, []).append(verb)
-    return verbs
+        event = moktan_event(record)
+        if "node" not in event:
+            continue  # run-level event (run_started, plan_computed, ...)
+        events.setdefault(event["node"], []).append(event["event"])
+    return events
 
 
 @pytest.mark.parametrize("max_workers", [1, 2])
@@ -186,20 +195,20 @@ def test_each_node_logs_exactly_one_line(tmp_path, caplog, max_workers):
 
     with caplog.at_level("INFO", logger="moktan"):
         run(node_c, max_workers=max_workers)
-    assert _verbs_by_path(caplog) == {
-        str(node_a.path): ["skipped"],
-        str(node_b.path): ["skipped"],
-        str(node_c.path): ["loaded"],
+    assert _node_events_by_path(caplog) == {
+        str(node_a.path): ["node_skipped"],
+        str(node_b.path): ["node_skipped"],
+        str(node_c.path): ["node_loaded"],
     }
 
     caplog.clear()
     node_c.path.unlink()
     with caplog.at_level("INFO", logger="moktan"):
         run(node_c, max_workers=max_workers)
-    assert _verbs_by_path(caplog) == {
-        str(node_a.path): ["skipped"],
-        str(node_b.path): ["loaded"],
-        str(node_c.path): ["computed"],
+    assert _node_events_by_path(caplog) == {
+        str(node_a.path): ["node_skipped"],
+        str(node_b.path): ["node_loaded"],
+        str(node_c.path): ["node_computed"],
     }
 
 

@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "polars>=1.42.1",
+    "structlog>=26.1.0",
 ]
 
 [build-system]

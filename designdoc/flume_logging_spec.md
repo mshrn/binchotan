@@ -335,13 +335,13 @@ plan_computed n_nodes=4 n_compute=4 n_load=0 n_skip=0 duration_s=0.00 thread=Mai
 computed out/leaf1.parquet (0.15s) rows=100 columns=1 bytes=2048 thread=ThreadPoolExecutor-0_0 run_id=1c8e4a2f9d67
 computed out/leaf3.parquet (0.15s) rows=100 columns=1 bytes=2048 thread=ThreadPoolExecutor-0_2 run_id=1c8e4a2f9d67
 computed out/leaf2.parquet (0.16s) rows=100 columns=1 bytes=2048 thread=ThreadPoolExecutor-0_1 run_id=1c8e4a2f9d67
-computed out/combined.parquet (0.02s) rows=1 columns=1 bytes=512 thread=MainThread run_id=1c8e4a2f9d67
+computed out/combined.parquet (0.02s) rows=1 columns=1 bytes=512 thread=ThreadPoolExecutor-0_0 run_id=1c8e4a2f9d67
 run_finished status=ok duration_s=0.19 n_computed=4 n_loaded=0 n_skipped=0 thread=MainThread run_id=1c8e4a2f9d67
 ```
 
 観察点:
 
-- `leaf1`〜`leaf3` の `thread` はそれぞれ異なる worker(executor が生成したスレッド名)だが、`combined` は `_finish_node` がメインスレッドでしか呼ばれないため常に `MainThread`(§2 の lock 設計どおり)。
+- `leaf1`〜`combined` の全ノードが `_compute_or_load` 自体は executor に submit されて実行される(§6 のスケジューラ設計どおり: pass2 に載る全ノードが submit 対象で、位置がグラフの終端かどうかは無関係)。したがって `combined` の `thread` も worker のいずれか(この実行例では leaf1 と同じ `ThreadPoolExecutor-0_0`、たまたま先に空いた worker が拾った)であり、**MainThread になるとは限らない**。**MainThread 固定なのは `_finish_node`(cache/counts のブックキーピング)と `run_started`/`plan_computed`/`run_finished` などの run 系イベントだけ**である。
 - 3 leaf の行の**出現順序は非決定的**(OS スケジューラ依存)だが、**全イベントの `run_id` は 1 回の run 内で必ず一致する**(§5 の明示引数伝播をテストで固定する対象)。
 - `combined` は 3 つの `node_computed` の完了を待ってから ready になるため、常に最後に出力される。
 

@@ -2,6 +2,7 @@ import polars as pl
 import pytest
 
 from moktan import Node
+from moktan.events import RunContext
 from moktan.graph import build_graph
 from moktan.runner import _execute_pass2, _plan
 
@@ -24,5 +25,6 @@ def test_memory_released_after_execution(tmp_path, max_workers):
     graph = build_graph(node_c)
     plan = _plan(graph, force=True)
 
-    cache = _execute_pass2(graph, plan, node_c, max_workers=max_workers)
+    ctx = RunContext(run_id="test")
+    cache = _execute_pass2(ctx, graph, plan, node_c, max_workers=max_workers)
     assert set(cache) == {node_c}

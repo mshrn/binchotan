@@ -24,7 +24,9 @@ import pytest
 from hypothesis import assume, given, settings
 from hypothesis import strategies as st
 
+from conftest import moktan_event
 from moktan import CycleError, Node, PipelineError, run
+from moktan.events import RunContext
 from moktan.graph import build_graph
 from moktan.runner import _execute_pass2, _plan
 
@@ -93,21 +95,21 @@ def _transitive_deps(dep_indices: DagSpec, v: int) -> set[int]:
 class _ListHandler(logging.Handler):
     def __init__(self) -> None:
         super().__init__()
-        self.messages: list[str] = []
+        self.events: list[dict] = []
 
     def emit(self, record: logging.LogRecord) -> None:
-        self.messages.append(record.getMessage())
+        self.events.append(moktan_event(record))
 
 
 @contextmanager
-def _capture_moktan_log() -> Iterator[list[str]]:
+def _capture_moktan_log(level: int = logging.INFO) -> Iterator[list[dict]]:
     logger = logging.getLogger("moktan")
     handler = _ListHandler()
     old_level = logger.level
     logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
+    logger.setLevel(level)
     try:
-        yield handler.messages
+        yield handler.events
     finally:
         logger.removeHandler(handler)
         logger.setLevel(old_level)
@@ -138,7 +140,7 @@ def test_resume_recomputes_exactly_the_stale_closure(
     stale = _stale_closure(spec, deleted)
     load_targets = {j for i in stale for j in spec[i] if j not in stale}
 
-    with _capture_moktan_log() as messages:
+    with _capture_moktan_log(level=logging.DEBUG) as events:
         resumed = run(root, max_workers=max_workers)
 
     # value and file invariants
@@ -149,22 +151,36 @@ def test_resume_recomputes_exactly_the_stale_closure(
         assert pl.read_parquet(node.path)["v"].to_list() == [values[i]]
         assert calls[i] == 1 + (1 if i in stale else 0), f"node {i}"
 
-    # log invariant: exactly one line per node, with the right verb
-    verbs: dict[str, list[str]] = {}
-    for message in messages:
-        verb, path = message.split()[:2]
-        verbs.setdefault(path, []).append(verb)
-    assert set(verbs) == {str(node.path) for node in nodes}
+    # event invariant: exactly one terminal INFO event per node, with the
+    # right event name, and node_planned's reason/decision agree with it.
+    terminal_events: dict[str, list[str]] = {}
+    planned: dict[str, dict] = {}
+    for event in events:
+        if "node" not in event:
+            continue
+        if event["event"] == "node_planned":
+            planned[event["node"]] = event
+        elif event["event"] in ("node_computed", "node_loaded", "node_skipped"):
+            terminal_events.setdefault(event["node"], []).append(event["event"])
+
+    assert set(terminal_events) == {str(node.path) for node in nodes}
+    assert set(planned) == {str(node.path) for node in nodes}
     for i, node in enumerate(nodes):
+        path = str(node.path)
         if i in stale:
-            expected = "computed"
-        elif i in load_targets:
-            expected = "loaded"
-        elif i == root_idx and not stale:
-            expected = "loaded"
+            expected_event = "node_computed"
+            expected_decision = "compute"
+            assert planned[path]["reason"] in ("missing", "forced", "dep_stale")
+        elif i in load_targets or (i == root_idx and not stale):
+            expected_event = "node_loaded"
+            expected_decision = "load"
+            assert planned[path]["reason"] == "fresh"
         else:
-            expected = "skipped"
-        assert verbs[str(node.path)] == [expected], f"node {i}"
+            expected_event = "node_skipped"
+            expected_decision = "skip"
+            assert planned[path]["reason"] == "fresh"
+        assert terminal_events[path] == [expected_event], f"node {i}"
+        assert planned[path]["decision"] == expected_decision, f"node {i}"
 
 
 @settings(max_examples=20, deadline=None)
@@ -228,7 +244,8 @@ def test_cache_holds_only_root_after_pass2(tmp_path_factory, spec, delete_seed, 
     plan = _plan(graph, force=False)
     assume(plan.needs_compute[root])
 
-    cache = _execute_pass2(graph, plan, root, max_workers=max_workers)
+    ctx = RunContext(run_id="test")
+    cache = _execute_pass2(ctx, graph, plan, root, max_workers=max_workers)
     assert set(cache) == {root}
 
 
