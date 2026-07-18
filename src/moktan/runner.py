@@ -59,8 +59,11 @@ def run(root: Node, *, force: bool = False, max_workers: int = 1) -> pl.DataFram
     with exactly one of ``run_finished`` / ``run_failed`` (§8): graph
     validation happens before ``run_started`` is emitted (a bad DAG means the
     run never started, so it gets no events at all), and everything from
-    ``run_started`` onward is wrapped so any exception -- not just
-    ``PipelineError`` -- still closes the run with ``run_failed``.
+    ``run_started`` onward that can affect whether the *pipeline* succeeds is
+    wrapped so any exception -- not just ``PipelineError`` -- closes the run
+    with ``run_failed``. A failure emitting ``run_finished`` itself (event
+    emission only, e.g. a broken custom sink) does not retroactively fail an
+    already-successful run; it's logged best-effort instead (rev4 §1.1).
     """
     if max_workers < 1:
         raise ValueError(f"max_workers must be >= 1, got {max_workers}")
@@ -112,42 +115,69 @@ def run(root: Node, *, force: bool = False, max_workers: int = 1) -> pl.DataFram
         cache = _execute_pass2(ctx, graph, plan, root, max_workers=max_workers)
         df = cache[root]
     except PipelineError as exc:
-        _emit(
-            ctx,
-            "run_failed",
-            logging.ERROR,
-            status="failed",
-            duration_s=time.perf_counter() - start,
-            failed=[str(n.path) for n in exc.failed],
-        )
+        _emit_run_failed(ctx, start, failed=[str(n.path) for n in exc.failed])
         raise
     except BaseException as exc:
         # Anything other than PipelineError (a bug in _plan, an OSError from
         # stat(), KeyboardInterrupt, ...): still close the run so run_started
         # never dangles unpaired (§8).
+        _emit_run_failed(ctx, start, failed=[], error=type(exc).__name__, message=str(exc))
+        raise
+
+    # The pipeline has already succeeded (df is ready) by this point. Emit
+    # run_finished in its own try/except: a failure here can only be in event
+    # emission itself (e.g. a buggy custom sink attached via
+    # RunRecorder.attach()), not in the pipeline, so it must not turn a
+    # successful run into run_failed -- but it also must not disappear
+    # silently, which is why run_finished used to sit outside any exception
+    # handling here at all (leaving run_started dangling unpaired on this
+    # rare path).
+    try:
+        _emit(
+            ctx,
+            "run_finished",
+            logging.INFO,
+            status="ok",
+            duration_s=time.perf_counter() - start,
+            n_computed=n_compute,
+            n_loaded=n_load,
+            n_skipped=n_skip,
+        )
+    except BaseException as exc:  # noqa: BLE001 - deliberately broad, see above
+        logging.getLogger("moktan").warning(
+            "run %s: pipeline succeeded but run_finished could not be emitted: %r",
+            ctx.run_id,
+            exc,
+        )
+    return df
+
+
+def _emit_run_failed(
+    ctx: RunContext,
+    start: float,
+    *,
+    failed: list[str],
+    error: str | None = None,
+    message: str | None = None,
+) -> None:
+    duration_s = time.perf_counter() - start
+    # Two explicit calls rather than building+unpacking a **fields dict: a
+    # dynamically-keyed dict unpacked into _emit's **fields could in
+    # principle collide with its `node: Node | None` keyword parameter, so
+    # spelling out the keyword names here keeps that statically checkable.
+    if error is not None or message is not None:
         _emit(
             ctx,
             "run_failed",
             logging.ERROR,
             status="failed",
-            duration_s=time.perf_counter() - start,
-            failed=[],
-            error=type(exc).__name__,
-            message=str(exc),
+            duration_s=duration_s,
+            failed=failed,
+            error=error,
+            message=message,
         )
-        raise
-
-    _emit(
-        ctx,
-        "run_finished",
-        logging.INFO,
-        status="ok",
-        duration_s=time.perf_counter() - start,
-        n_computed=n_compute,
-        n_loaded=n_load,
-        n_skipped=n_skip,
-    )
-    return df
+    else:
+        _emit(ctx, "run_failed", logging.ERROR, status="failed", duration_s=duration_s, failed=failed)
 
 
 def _decision(node: Node, plan: Plan) -> Decision:
@@ -177,7 +207,7 @@ def _plan(graph: Graph, root: Node, *, force: bool) -> Plan:
         needs_compute=needs_compute,
         reasons=reasons,
         recompute=recompute,
-        pass2=frozenset(pass2),
+        pass2=pass2,
     )
 
 

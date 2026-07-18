@@ -14,6 +14,7 @@ import time
 import polars as pl
 import pytest
 
+from conftest import assert_subprocess_silent
 from conftest import four_node_dag as _four_node_dag
 from conftest import moktan_event
 from moktan import Node, PipelineError, RunRecorder, run
@@ -420,9 +421,6 @@ def test_failing_run_is_silent_without_configure_logging(tmp_path):
     root logger for the whole session, so logging.lastResort never fires
     inside the test process itself; capsys can't observe this regression
     class (see tests/test_events.py::test_library_is_silent_for_error_level_events_too)."""
-    import subprocess
-    import sys
-
     script = (
         "from moktan import Node, PipelineError, run\n"
         "def make_bad():\n"
@@ -433,9 +431,7 @@ def test_failing_run_is_silent_without_configure_logging(tmp_path):
         "except PipelineError:\n"
         "    pass\n"
     )
-    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
-    assert result.stdout == ""
-    assert result.stderr == ""
+    assert_subprocess_silent(script)
 
 
 def test_run_id_consistent_across_max_workers_4_and_differs_between_runs(tmp_path, caplog):
@@ -500,3 +496,49 @@ def test_write_report_round_trips_to_markdown(tmp_path):
     report_path = tmp_path / "report.md"
     recorder.write_report(report_path)
     assert report_path.read_text() == recorder.to_markdown()
+
+
+class _AppendFailsForEvent(list):
+    """A list whose .append() raises for one specific event name, so a sink
+    built on it fails at exactly one emission point instead of every one."""
+
+    def __init__(self, target_event: str) -> None:
+        super().__init__()
+        self._target_event = target_event
+
+    def append(self, item: dict) -> None:  # type: ignore[override]
+        if item.get("event") == self._target_event:
+            raise RuntimeError("sink is broken")
+        super().append(item)
+
+
+def test_run_finished_emission_failure_does_not_fail_a_successful_run(tmp_path, caplog):
+    """§1.1 (rev4): if emitting run_finished itself fails (e.g. a broken
+    custom RunRecorder-like sink), the pipeline's own success must not be
+    discarded -- run() still returns the correct df, no exception escapes,
+    and a best-effort warning is logged instead of run_started dangling
+    unpaired with neither run_finished nor run_failed."""
+    from moktan.events import _register, _unregister
+
+    class _Sink:
+        def __init__(self) -> None:
+            self.events: list[dict] = _AppendFailsForEvent("run_finished")
+
+    node = Node(tmp_path / "a.parquet", lambda: pl.DataFrame({"x": [1]}))
+
+    sink = _Sink()
+    caplog.set_level(logging.WARNING, logger="moktan")
+    _register(sink)
+    try:
+        df = run(node, max_workers=1)
+    finally:
+        _unregister(sink)
+
+    assert df["x"].to_list() == [1]  # the pipeline itself succeeded
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "run_finished could not be emitted" in warnings[0].getMessage()
+    # run_started (and everything before the broken emit) still reached the
+    # sink normally -- only run_finished's append blew up.
+    assert any(e["event"] == "run_started" for e in sink.events)
+    assert not any(e["event"] == "run_finished" for e in sink.events)

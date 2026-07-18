@@ -95,6 +95,22 @@ def _needs_quoting(value: str) -> bool:
     return any(c in value for c in (" ", '"', "\n", "="))
 
 
+def _format_list_element(value: object) -> str:
+    # List elements (currently only `deps`, i.e. paths) are always wrapped in
+    # quotes, matching Python's own list-of-str repr -- unlike a bare/scalar
+    # value they're never rendered unquoted, so there's no readability cost to
+    # always quoting. Only the quote *style* depends on content: plain repr()
+    # (single-quoted, the common case) when nothing needs escaping, else
+    # json.dumps() (double-quoted) so an embedded `"` or newline can't corrupt
+    # the "one event, one line" console contract. A space inside an element
+    # still can't be escaped away without changing what the path *is*, so
+    # (like the legacy-verb head below) it remains a known limitation for
+    # naive whitespace tokenization beyond the first two tokens (§6.1).
+    if isinstance(value, str) and _needs_quoting(value):
+        return json.dumps(value)
+    return repr(value)
+
+
 def _format_value(value: object) -> str:
     if isinstance(value, float):
         # Dispatch on type, not the key name "duration_s": any future float
@@ -102,7 +118,7 @@ def _format_value(value: object) -> str:
         # to full-precision repr.
         return _format_duration(value)
     if isinstance(value, list):
-        return repr(value)
+        return "[" + ", ".join(_format_list_element(v) for v in value) + "]"
     if isinstance(value, str) and _needs_quoting(value):
         return json.dumps(value)  # also escapes embedded `"` and newlines
     return str(value)
@@ -122,6 +138,15 @@ def _render_console_message(
         verb = _LEGACY_VERBS[event]
         node = rest.pop("node", None)
         duration = rest.pop("duration_s", None)
+        if isinstance(node, str):
+            # This position is a BARE token per the split()[:2] back-compat
+            # contract (§6.1) -- it can't be wrapped in quotes without
+            # breaking that contract, so a space still splits it into extra
+            # tokens (known, accepted limitation, documented in the spec). A
+            # literal newline is different: it would corrupt the "one event,
+            # one line" invariant regardless of quoting, so that one is
+            # neutralized here.
+            node = node.replace("\n", "\\n")
         head = verb if node is None else f"{verb} {node}"
         if duration is not None:
             head = f"{head} ({_format_duration(duration)}s)"
@@ -230,6 +255,7 @@ class _JSONFormatter(logging.Formatter):
 
 
 _installed_handlers: list[logging.Handler] = []
+_configure_lock = threading.Lock()
 
 
 def configure_logging(
@@ -247,19 +273,24 @@ def configure_logging(
     module imported twice) doesn't multiply every log line.
     """
     target = logging.getLogger("moktan")
-    for handler in _installed_handlers:
-        target.removeHandler(handler)
-        handler.close()
-    _installed_handlers.clear()
+    with _configure_lock:
+        # Guards the whole read-clear-append sequence on _installed_handlers,
+        # matching _registry's _registry_lock protection: without this, two
+        # near-simultaneous calls can both read the same old list before
+        # either clears it, double-installing handlers.
+        for handler in _installed_handlers:
+            target.removeHandler(handler)
+            handler.close()
+        _installed_handlers.clear()
 
-    target.setLevel(level)
-    if console:
-        console_handler: logging.Handler = logging.StreamHandler()
-        console_handler.setFormatter(logging.Formatter("%(message)s"))
-        target.addHandler(console_handler)
-        _installed_handlers.append(console_handler)
-    if json_path is not None:
-        json_handler: logging.Handler = logging.FileHandler(json_path)
-        json_handler.setFormatter(_JSONFormatter())
-        target.addHandler(json_handler)
-        _installed_handlers.append(json_handler)
+        target.setLevel(level)
+        if console:
+            console_handler: logging.Handler = logging.StreamHandler()
+            console_handler.setFormatter(logging.Formatter("%(message)s"))
+            target.addHandler(console_handler)
+            _installed_handlers.append(console_handler)
+        if json_path is not None:
+            json_handler: logging.Handler = logging.FileHandler(json_path)
+            json_handler.setFormatter(_JSONFormatter())
+            target.addHandler(json_handler)
+            _installed_handlers.append(json_handler)

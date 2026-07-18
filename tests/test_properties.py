@@ -26,7 +26,7 @@ from hypothesis import strategies as st
 
 from conftest import moktan_event
 from moktan import CycleError, Node, PipelineError, run
-from moktan.events import RunContext
+from moktan.events import RunContext, _LEGACY_VERBS
 from moktan.graph import build_graph
 from moktan.runner import _execute_pass2, _plan
 
@@ -167,7 +167,7 @@ def test_resume_recomputes_exactly_the_stale_closure(
             continue
         if event["event"] == "node_planned":
             planned[event["node"]] = event
-        elif event["event"] in ("node_computed", "node_loaded", "node_skipped"):
+        elif event["event"] in _LEGACY_VERBS:
             terminal_events.setdefault(event["node"], []).append(event["event"])
 
     assert set(terminal_events) == {str(node.path) for node in nodes}

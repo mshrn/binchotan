@@ -12,6 +12,7 @@ import re
 import polars as pl
 import pytest
 
+from conftest import assert_subprocess_silent
 from moktan.events import RunContext, _emit, _register, _unregister
 from moktan.node import Node
 
@@ -165,6 +166,67 @@ def test_console_value_quoted_when_it_contains_bare_equals(caplog_moktan, ctx, t
     )
 
 
+def test_legacy_verb_console_line_escapes_newline_in_node_path(caplog_moktan, ctx, tmp_path):
+    """§1.2 (rev4): a node path is spliced bare into the legacy-verb head
+    (unlike other fields, it can't be wrapped in quotes without breaking the
+    split()[:2] back-compat contract), so a literal newline in it must still
+    be neutralized to preserve the one-event-one-line console contract."""
+    node = Node(tmp_path / "weird\nname.parquet", lambda: pl.DataFrame())
+    _emit(ctx, "node_skipped", logging.INFO, node=node)
+    message = _sole_message(caplog_moktan)
+    assert "\n" not in message
+    assert message == (
+        f"skipped {str(node.path).replace(chr(10), chr(92) + 'n')} "
+        f"thread=MainThread run_id={ctx.run_id}"
+    )
+
+
+def test_node_planned_console_line_escapes_quotes_and_newlines_in_deps(caplog_moktan, ctx, tmp_path):
+    """§1.3 (rev4): unlike a bare scalar, a list element (deps path) is
+    always quoted, but the quote style must switch to an escaping form when
+    the element itself contains a `"` or newline, or the one-line console
+    contract / quote balance would break."""
+    node = Node(tmp_path / "orders_clean.parquet", lambda: pl.DataFrame())
+    _emit(
+        ctx,
+        "node_planned",
+        logging.DEBUG,
+        node=node,
+        decision="compute",
+        reason="dep_stale",
+        deps=['out/weird"raw\n.parquet'],
+    )
+    message = _sole_message(caplog_moktan)
+    assert "\n" not in message
+    assert message == (
+        f"node_planned node={node.path} decision=compute reason=dep_stale "
+        'deps=["out/weird\\"raw\\n.parquet"] thread=MainThread run_id=' + ctx.run_id
+    )
+
+
+def test_node_planned_console_line_deps_without_escaping_still_matches_repr(
+    caplog_moktan, ctx, tmp_path
+):
+    """No-regression check: a deps element that needs no escaping keeps the
+    plain single-quoted repr() form (matching the existing §12 golden
+    examples) rather than switching to json.dumps()'s double quotes."""
+    node = Node(tmp_path / "orders_clean.parquet", lambda: pl.DataFrame())
+    _emit(
+        ctx,
+        "node_planned",
+        logging.DEBUG,
+        node=node,
+        decision="compute",
+        reason="dep_stale",
+        deps=["out/orders_raw.parquet", "out/other.parquet"],
+    )
+    assert _sole_message(caplog_moktan) == (
+        f"node_planned node={node.path} decision=compute reason=dep_stale "
+        "deps=['out/orders_raw.parquet', 'out/other.parquet'] thread=MainThread run_id="
+        + ctx.run_id
+    )
+
+
 def test_run_failed_console_line_renders_failed_list_as_repr(caplog_moktan, ctx):
     _emit(
         ctx,
@@ -272,18 +334,24 @@ def test_run_id_is_12_hex_chars_and_unique_per_run():
 
 
 def test_configure_logging_json_lines_output(tmp_path, ctx):
+    """§2.1 (rev4): snapshot/diff the logger's handlers rather than assuming
+    it starts empty -- events.py installs a permanent NullHandler at import
+    time, and the teardown here must not sweep that up (it would make other
+    tests order-dependent on this one having run first)."""
     from moktan.events import configure_logging
+
+    logger = logging.getLogger("moktan")
+    handlers_before = set(logger.handlers)
 
     json_path = tmp_path / "moktan.jsonl"
     configure_logging(json_path=json_path, console=False)
     try:
         node = Node(tmp_path / "a.parquet", lambda: pl.DataFrame())
         _emit(ctx, "node_computed", logging.INFO, node=node, duration_s=0.1, rows=1, columns=1, bytes=1)
-        for handler in logging.getLogger("moktan").handlers:
+        for handler in logger.handlers:
             handler.flush()
     finally:
-        logger = logging.getLogger("moktan")
-        for handler in list(logger.handlers):
+        for handler in set(logger.handlers) - handlers_before:
             logger.removeHandler(handler)
             handler.close()
         logger.setLevel(logging.NOTSET)  # configure_logging() sets it; don't leak to other tests
@@ -298,15 +366,23 @@ def test_configure_logging_json_lines_output(tmp_path, ctx):
 
 def test_configure_logging_is_idempotent(tmp_path, ctx):
     """§1.5 (rev3): calling configure_logging() twice must replace, not
-    stack, handlers -- otherwise every event prints/writes N times."""
+    stack, handlers -- otherwise every event prints/writes N times.
+
+    §2.1 (rev4): counts handlers relative to a before-snapshot, not an
+    absolute "== 1", so this doesn't depend on whether some earlier test
+    left the permanent NullHandler (installed at import, events.py) in
+    place or already stripped it -- this test previously only passed by
+    accident of file-level test ordering (verified: failed when run alone).
+    """
     from moktan.events import configure_logging
 
     json_path = tmp_path / "moktan.jsonl"
     logger = logging.getLogger("moktan")
+    handlers_before = set(logger.handlers)
     try:
         configure_logging(json_path=json_path, console=False)
         configure_logging(json_path=json_path, console=False)  # re-configure, same target
-        assert len(logger.handlers) == 1
+        assert len(set(logger.handlers) - handlers_before) == 1
 
         node = Node(tmp_path / "a.parquet", lambda: pl.DataFrame())
         _emit(ctx, "node_computed", logging.INFO, node=node, duration_s=0.1, rows=1, columns=1, bytes=1)
@@ -316,7 +392,7 @@ def test_configure_logging_is_idempotent(tmp_path, ctx):
         lines = json_path.read_text().strip().splitlines()
         assert len(lines) == 1  # not 2
     finally:
-        for handler in list(logger.handlers):
+        for handler in set(logger.handlers) - handlers_before:
             logger.removeHandler(handler)
             handler.close()
         logger.setLevel(logging.NOTSET)
@@ -343,9 +419,6 @@ def test_library_is_silent_for_error_level_events_too(tmp_path):
     this class of regression. A subprocess inherits the real OS-level stderr,
     unaffected by pytest's capture.
     """
-    import subprocess
-    import sys
-
     script = (
         "from moktan.events import RunContext, _emit\n"
         "import logging\n"
@@ -353,9 +426,7 @@ def test_library_is_silent_for_error_level_events_too(tmp_path):
         "_emit(ctx, 'node_failed', logging.ERROR, error='RuntimeError', message='boom')\n"
         "_emit(ctx, 'run_failed', logging.ERROR, status='failed', duration_s=0.1, failed=[])\n"
     )
-    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
-    assert result.stdout == ""
-    assert result.stderr == ""
+    assert_subprocess_silent(script)
 
 
 def test_structlog_global_config_does_not_affect_moktan(caplog_moktan, ctx, tmp_path):

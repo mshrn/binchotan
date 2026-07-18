@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +12,19 @@ import polars as pl
 
 from moktan.events import moktan_event as _moktan_event
 from moktan.node import Node
+
+
+def assert_subprocess_silent(script: str) -> None:
+    """Run ``script`` in a fresh child process and assert it produced no
+    stdout/stderr output. Used by the "library is silent without
+    configure_logging()" regression tests: pytest's own logging plugin keeps
+    a handler attached to the root logger for the whole session, so
+    ``logging.lastResort`` never fires inside the test process itself --
+    capsys can't observe that regression class, but a subprocess inherits the
+    real OS-level stderr, unaffected by pytest's capture."""
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+    assert result.stdout == ""
+    assert result.stderr == ""
 
 
 def moktan_event(record: logging.LogRecord) -> dict[str, Any]:
