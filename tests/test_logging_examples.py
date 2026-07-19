@@ -14,9 +14,9 @@ import time
 import polars as pl
 import pytest
 
-from conftest import assert_subprocess_silent
+from conftest import AppendFailsForEvent, assert_subprocess_silent
 from conftest import four_node_dag as _four_node_dag
-from conftest import moktan_event
+from conftest import moktan_event, moktan_warnings
 from moktan import Node, PipelineError, RunRecorder, run
 
 
@@ -500,7 +500,7 @@ def test_jsonl_stays_valid_when_a_broken_sink_triggers_a_fallback_warning(
     configure_logging(json_path=json_path, console=False, level=logging.WARNING)
 
     node = Node(tmp_path / "a.parquet", lambda: pl.DataFrame({"x": [1]}))
-    broken = RunRecorder(events=_AppendFailsForEvent("run_finished"))
+    broken = RunRecorder(events=AppendFailsForEvent("run_finished"))
     with broken.attach():
         run(node, max_workers=1)
     for handler in logger.handlers:
@@ -526,59 +526,54 @@ def test_write_report_round_trips_to_markdown(tmp_path):
     assert report_path.read_text() == recorder.to_markdown()
 
 
-class _AppendFailsForEvent(list):
-    """A list whose .append() raises for one specific event name, so a sink
-    built on it fails at exactly one emission point instead of every one."""
-
-    def __init__(self, target_event: str) -> None:
-        super().__init__()
-        self._target_event = target_event
-
-    def append(self, item: dict) -> None:  # type: ignore[override]
-        if item.get("event") == self._target_event:
-            raise RuntimeError("sink is broken")
-        super().append(item)
+_SUCCESS_SEQUENCE = ["run_started", "plan_computed", "node_planned", "node_computed", "run_finished"]
+_FAILURE_SEQUENCE = ["run_started", "plan_computed", "node_planned", "node_failed", "run_failed"]
 
 
-@pytest.mark.parametrize(
-    "target_event", ["run_started", "plan_computed", "node_planned", "node_computed", "run_finished"]
-)
+def _assert_broken_sink_isolated(
+    caplog: pytest.LogCaptureFixture,
+    broken: RunRecorder,
+    healthy: RunRecorder,
+    target_event: str,
+    expected_sequence: list[str],
+) -> None:
+    """Shared assertion tail for the broken-sink isolation tests (rev6 §4-5).
+
+    Pins BOTH halves of the rev5 §1.1(c) contract: the broken sink loses
+    exactly ``target_event`` and receives every other event (so a future
+    "unregister the sink on first failure" regression fails here), and the
+    healthy sink sees the complete, correctly-paired stream. Warning count is
+    scoped to the "moktan" logger (rev6 §1.2) so third-party WARNINGs can't
+    break these assertions."""
+    warnings = moktan_warnings(caplog)
+    assert len(warnings) == 1
+    assert target_event in warnings[0].getMessage()
+
+    assert [e["event"] for e in broken.events] == [
+        e for e in expected_sequence if e != target_event
+    ]
+    assert [e["event"] for e in healthy.events] == expected_sequence
+
+
+@pytest.mark.parametrize("target_event", _SUCCESS_SEQUENCE)
 def test_broken_sink_does_not_affect_a_successful_run(tmp_path, caplog, target_event):
     """rev5 §1.1 (root fix, not a per-site patch): a sink whose .events.append
     raises must never affect what run() returns, no matter which of the
     emission sites it chokes on -- rev4 only protected run_finished; this
-    parametrization covers every site a successful single-node run reaches.
-    A healthy sink registered alongside the broken one must still receive the
-    complete, correctly-paired event stream (no starvation, no dangling
-    run_started), and exactly one warning is logged naming the broken event."""
+    parametrization covers every site a successful single-node run reaches."""
     caplog.set_level(logging.WARNING, logger="moktan")
     node = Node(tmp_path / "a.parquet", lambda: pl.DataFrame({"x": [1]}))
 
-    broken = RunRecorder(events=_AppendFailsForEvent(target_event))
+    broken = RunRecorder(events=AppendFailsForEvent(target_event))
     healthy = RunRecorder()
     with broken.attach(), healthy.attach():
         df = run(node, max_workers=1)
 
     assert df["x"].to_list() == [1]  # the pipeline itself succeeded
-
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert len(warnings) == 1
-    assert target_event in warnings[0].getMessage()
-
-    assert not any(e["event"] == target_event for e in broken.events)
-    healthy_names = [e["event"] for e in healthy.events]
-    assert healthy_names == [
-        "run_started",
-        "plan_computed",
-        "node_planned",
-        "node_computed",
-        "run_finished",
-    ]
+    _assert_broken_sink_isolated(caplog, broken, healthy, target_event, _SUCCESS_SEQUENCE)
 
 
-@pytest.mark.parametrize(
-    "target_event", ["run_started", "plan_computed", "node_planned", "node_failed", "run_failed"]
-)
+@pytest.mark.parametrize("target_event", _FAILURE_SEQUENCE)
 def test_broken_sink_does_not_affect_a_failing_run(tmp_path, caplog, target_event):
     """rev5 §1.1: same guarantee as above, on the failure path -- a broken
     sink must not change PipelineError into some other exception (it would if
@@ -592,16 +587,10 @@ def test_broken_sink_does_not_affect_a_failing_run(tmp_path, caplog, target_even
 
     node = Node(tmp_path / "a.parquet", make_bad)
 
-    broken = RunRecorder(events=_AppendFailsForEvent(target_event))
+    broken = RunRecorder(events=AppendFailsForEvent(target_event))
     healthy = RunRecorder()
     with broken.attach(), healthy.attach(), pytest.raises(PipelineError) as exc_info:
         run(node, force=True, max_workers=1)
     assert exc_info.value.node is node
 
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert len(warnings) == 1
-    assert target_event in warnings[0].getMessage()
-
-    assert not any(e["event"] == target_event for e in broken.events)
-    healthy_names = [e["event"] for e in healthy.events]
-    assert healthy_names == ["run_started", "plan_computed", "node_planned", "node_failed", "run_failed"]
+    _assert_broken_sink_isolated(caplog, broken, healthy, target_event, _FAILURE_SEQUENCE)

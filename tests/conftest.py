@@ -35,6 +35,35 @@ def moktan_logger_state() -> Iterator[logging.Logger]:
     logger.setLevel(logging.NOTSET)
 
 
+class AppendFailsForEvent(list):
+    """A list whose .append() raises for one specific event name, so a sink
+    built on it fails at exactly one emission point instead of every one.
+    Used as ``RunRecorder(events=AppendFailsForEvent(...))`` by the broken-sink
+    isolation tests (rev5 §1.1 / rev6 acceptance)."""
+
+    def __init__(self, target_event: str) -> None:
+        super().__init__()
+        self._target_event = target_event
+
+    def append(self, item: dict) -> None:  # type: ignore[override]
+        if item.get("event") == self._target_event:
+            raise RuntimeError("sink is broken")
+        super().append(item)
+
+
+def moktan_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """WARNING-level records emitted by the "moktan" logger specifically.
+    caplog's handler sits on the root logger and captures every propagating
+    record, so filtering by level alone would count warnings from polars/other
+    libraries too -- tests asserting "exactly one moktan warning" must filter
+    by logger name as well (rev6 §1.2). Exactly-WARNING (not >=) because
+    moktan's own node_failed/run_failed event records are ERROR and must not
+    be counted as warnings."""
+    return [
+        r for r in caplog.records if r.name == "moktan" and r.levelno == logging.WARNING
+    ]
+
+
 def assert_subprocess_silent(script: str) -> None:
     """Run ``script`` in a fresh child process and assert it produced no
     stdout/stderr output. Used by the "library is silent without
