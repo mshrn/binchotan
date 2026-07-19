@@ -88,24 +88,39 @@ def _format_duration(value: float) -> str:
     return f"{value:.2f}"
 
 
+# Single source of truth for "which characters break the one-event-one-line
+# console contract" (rev5 §1.3: `_needs_quoting` and the bare-token escape
+# below used to each hardcode `\n` separately, and both silently missed `\r`
+# as a result -- a lone carriage return still split a line for the same
+# reason `\n` does).
+_LINE_BREAK_ESCAPES: dict[str, str] = {"\n": "\\n", "\r": "\\r"}
+
+
 def _needs_quoting(value: str) -> bool:
     # Any of these break the whitespace-delimited "key=value ..." tail (or,
-    # for `"`/newline, the "one event, one line" console contract itself) if
-    # left bare -- e.g. a node_failed message from `str(exc)`.
-    return any(c in value for c in (" ", '"', "\n", "="))
+    # for `"`/a line-break character, the "one event, one line" console
+    # contract itself) if left bare -- e.g. a node_failed message from
+    # `str(exc)`.
+    return any(c in value for c in (" ", '"', "=", *_LINE_BREAK_ESCAPES))
+
+
+def _escape_bare_token(value: str) -> str:
+    # For a value that must appear as a BARE (unquoted) token per the
+    # split()[:2] back-compat contract (§6.1) -- the legacy-verb head's node
+    # path. It can't be wrapped in quotes without breaking that contract, so
+    # a space still splits it into extra tokens (known, accepted limitation,
+    # documented in the spec). A line-break character is different: left
+    # alone it would corrupt the "one event, one line" invariant regardless
+    # of quoting, so those are neutralized here.
+    for raw, escaped in _LINE_BREAK_ESCAPES.items():
+        value = value.replace(raw, escaped)
+    return value
 
 
 def _format_list_element(value: object) -> str:
-    # List elements (currently only `deps`, i.e. paths) are always wrapped in
-    # quotes, matching Python's own list-of-str repr -- unlike a bare/scalar
-    # value they're never rendered unquoted, so there's no readability cost to
-    # always quoting. Only the quote *style* depends on content: plain repr()
-    # (single-quoted, the common case) when nothing needs escaping, else
-    # json.dumps() (double-quoted) so an embedded `"` or newline can't corrupt
-    # the "one event, one line" console contract. A space inside an element
-    # still can't be escaped away without changing what the path *is*, so
-    # (like the legacy-verb head below) it remains a known limitation for
-    # naive whitespace tokenization beyond the first two tokens (§6.1).
+    # List elements are always quoted; switch from repr()'s single quotes to
+    # json.dumps()'s escaping double quotes only when needed. A space in an
+    # element stays unescaped -- accepted limitation, see spec §6.1.
     if isinstance(value, str) and _needs_quoting(value):
         return json.dumps(value)
     return repr(value)
@@ -139,14 +154,7 @@ def _render_console_message(
         node = rest.pop("node", None)
         duration = rest.pop("duration_s", None)
         if isinstance(node, str):
-            # This position is a BARE token per the split()[:2] back-compat
-            # contract (§6.1) -- it can't be wrapped in quotes without
-            # breaking that contract, so a space still splits it into extra
-            # tokens (known, accepted limitation, documented in the spec). A
-            # literal newline is different: it would corrupt the "one event,
-            # one line" invariant regardless of quoting, so that one is
-            # neutralized here.
-            node = node.replace("\n", "\\n")
+            node = _escape_bare_token(node)
         head = verb if node is None else f"{verb} {node}"
         if duration is not None:
             head = f"{head} ({_format_duration(duration)}s)"
@@ -204,16 +212,43 @@ def _dispatch(event: dict[str, Any]) -> None:
     with _registry_lock:
         sinks = list(_registry)
     for sink in sinks:
-        sink.events.append(event)
+        try:
+            sink.events.append(event)
+        except Exception as exc:  # noqa: BLE001 - deliberately broad, see below
+            # rev5 §1.1 (root fix for the recurring "same contract, N emission
+            # sites, one patched" bug class): a broken sink must never be able
+            # to affect what run() returns or raises, no matter which of the
+            # ~11 _emit call sites it chokes on -- isolating it here (instead
+            # of wrapping individual call sites in runner.py) makes that true
+            # by construction everywhere at once, and a broken sink no longer
+            # starves sinks registered after it in the loop. KeyboardInterrupt
+            # / SystemExit deliberately are NOT caught: an operator's Ctrl-C
+            # must still abort the run even if it lands inside a sink's
+            # .append().
+            logger.warning(
+                "moktan: a sink failed to record event %r (run_id=%s): %r",
+                event.get("event"),
+                event.get("run_id"),
+                exc,
+            )
 
 
 # --- emission ----------------------------------------------------------------
 
 
+def _listening(level: int) -> bool:
+    """Would anything actually observe an event emitted at ``level`` right
+    now -- either a sink (which bypasses stdlib levels entirely, spec §2) or
+    the stdlib ``"moktan"`` logger itself? Shared by :func:`_emit`'s early
+    return and by callers (e.g. runner.py's node_planned loop) that want to
+    skip building expensive event fields before ever calling :func:`_emit`."""
+    return bool(_registry) or logger.isEnabledFor(level)
+
+
 def _emit(
     ctx: RunContext, event: str, level: int, *, node: Node | None = None, **fields: object
 ) -> None:
-    if not _registry and not logger.isEnabledFor(level):
+    if not _listening(level):
         # Nobody's listening: skip building the event dict, formatting the
         # timestamp, and rendering the console string. structlog's processor
         # chain runs *before* the stdlib level check, so without this the
@@ -230,7 +265,12 @@ def _emit(
         "+00:00", "Z"
     )
     _dispatch(dict(ordered))
-    _struct_logger.log(level, event, **{k: v for k, v in ordered.items() if k != "event"})
+    if logger.isEnabledFor(level):
+        # A sink-only listener (RunRecorder attached, stdlib logger left
+        # unconfigured) already got its event via _dispatch above; skip
+        # rendering the console line and pushing it through structlog only to
+        # have the stdlib logger discard it at its own level check.
+        _struct_logger.log(level, event, **{k: v for k, v in ordered.items() if k != "event"})
 
 
 def moktan_event(record: logging.LogRecord) -> dict[str, Any] | None:
@@ -249,9 +289,22 @@ def moktan_event(record: logging.LogRecord) -> dict[str, Any] | None:
 class _JSONFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         event = moktan_event(record)
-        if event is None:  # pragma: no cover - defensive, all our records set it
-            return super().format(record)
-        return json.dumps(event, default=str)
+        if event is not None:
+            return json.dumps(event, default=str)
+        # A plain stdlib record on the "moktan" logger that didn't go through
+        # _emit -- currently only _dispatch's best-effort "a sink failed"
+        # warning (§1.1). Still emit valid, self-describing JSON rather than
+        # falling back to plain text: the §6.2 contract is "every line in the
+        # file independently parses with json.loads", and that must hold even
+        # on the one run where observability itself already hiccupped.
+        return json.dumps(
+            {
+                "event": "log_message",
+                "level": record.levelname,
+                "logger": record.name,
+                "message": record.getMessage(),
+            }
+        )
 
 
 _installed_handlers: list[logging.Handler] = []

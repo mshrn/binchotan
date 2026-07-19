@@ -14,7 +14,7 @@ from queue import SimpleQueue
 
 import polars as pl
 
-from moktan.events import Decision, Reason, RunContext, _emit, new_run_id
+from moktan.events import Decision, Reason, RunContext, _emit, _listening, new_run_id
 from moktan.graph import Graph, build_graph
 from moktan.node import Node
 
@@ -61,9 +61,12 @@ def run(root: Node, *, force: bool = False, max_workers: int = 1) -> pl.DataFram
     run never started, so it gets no events at all), and everything from
     ``run_started`` onward that can affect whether the *pipeline* succeeds is
     wrapped so any exception -- not just ``PipelineError`` -- closes the run
-    with ``run_failed``. A failure emitting ``run_finished`` itself (event
-    emission only, e.g. a broken custom sink) does not retroactively fail an
-    already-successful run; it's logged best-effort instead (rev4 §1.1).
+    with ``run_failed``. Event emission itself never raises due to a broken
+    sink: a sink whose ``.events.append()`` raises is caught and warned about
+    per-event inside ``events._dispatch`` (rev5 §1.1), so no ``_emit`` call
+    anywhere in this function can turn pipeline success into ``run_failed``,
+    or leave ``run_started`` dangling unpaired -- only a genuine pipeline
+    failure changes which of the two closing events fires.
     """
     if max_workers < 1:
         raise ValueError(f"max_workers must be >= 1, got {max_workers}")
@@ -94,16 +97,21 @@ def run(root: Node, *, force: bool = False, max_workers: int = 1) -> pl.DataFram
             duration_s=plan_duration,
         )
 
-        for node in graph.order:
-            _emit(
-                ctx,
-                "node_planned",
-                logging.DEBUG,
-                node=node,
-                decision=decisions[node],
-                reason=plan.reasons[node],
-                deps=[str(dep.path) for dep in node.deps.values()],
-            )
+        if _listening(logging.DEBUG):
+            # Skip building a deps=[...] list (a Path-to-str conversion per
+            # edge) for every node when nobody could observe node_planned
+            # anyway -- same guard _emit itself uses internally, hoisted here
+            # so the per-node work is skipped too, not just the emission.
+            for node in graph.order:
+                _emit(
+                    ctx,
+                    "node_planned",
+                    logging.DEBUG,
+                    node=node,
+                    decision=decisions[node],
+                    reason=plan.reasons[node],
+                    deps=[str(dep.path) for dep in node.deps.values()],
+                )
 
         for node in graph.order:
             if decisions[node] == "skip":
@@ -121,51 +129,28 @@ def run(root: Node, *, force: bool = False, max_workers: int = 1) -> pl.DataFram
         # Anything other than PipelineError (a bug in _plan, an OSError from
         # stat(), KeyboardInterrupt, ...): still close the run so run_started
         # never dangles unpaired (§8).
-        _emit_run_failed(ctx, start, failed=[], error=type(exc).__name__, message=str(exc))
+        _emit_run_failed(ctx, start, failed=[], exc=exc)
         raise
 
-    # The pipeline has already succeeded (df is ready) by this point. Emit
-    # run_finished in its own try/except: a failure here can only be in event
-    # emission itself (e.g. a buggy custom sink attached via
-    # RunRecorder.attach()), not in the pipeline, so it must not turn a
-    # successful run into run_failed -- but it also must not disappear
-    # silently, which is why run_finished used to sit outside any exception
-    # handling here at all (leaving run_started dangling unpaired on this
-    # rare path).
-    try:
-        _emit(
-            ctx,
-            "run_finished",
-            logging.INFO,
-            status="ok",
-            duration_s=time.perf_counter() - start,
-            n_computed=n_compute,
-            n_loaded=n_load,
-            n_skipped=n_skip,
-        )
-    except BaseException as exc:  # noqa: BLE001 - deliberately broad, see above
-        logging.getLogger("moktan").warning(
-            "run %s: pipeline succeeded but run_finished could not be emitted: %r",
-            ctx.run_id,
-            exc,
-        )
+    # The pipeline has already succeeded (df is ready) by this point.
+    _emit(
+        ctx,
+        "run_finished",
+        logging.INFO,
+        status="ok",
+        duration_s=time.perf_counter() - start,
+        n_computed=n_compute,
+        n_loaded=n_load,
+        n_skipped=n_skip,
+    )
     return df
 
 
 def _emit_run_failed(
-    ctx: RunContext,
-    start: float,
-    *,
-    failed: list[str],
-    error: str | None = None,
-    message: str | None = None,
+    ctx: RunContext, start: float, *, failed: list[str], exc: BaseException | None = None
 ) -> None:
     duration_s = time.perf_counter() - start
-    # Two explicit calls rather than building+unpacking a **fields dict: a
-    # dynamically-keyed dict unpacked into _emit's **fields could in
-    # principle collide with its `node: Node | None` keyword parameter, so
-    # spelling out the keyword names here keeps that statically checkable.
-    if error is not None or message is not None:
+    if exc is not None:
         _emit(
             ctx,
             "run_failed",
@@ -173,8 +158,8 @@ def _emit_run_failed(
             status="failed",
             duration_s=duration_s,
             failed=failed,
-            error=error,
-            message=message,
+            error=type(exc).__name__,
+            message=str(exc),
         )
     else:
         _emit(ctx, "run_failed", logging.ERROR, status="failed", duration_s=duration_s, failed=failed)

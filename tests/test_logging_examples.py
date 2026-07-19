@@ -457,32 +457,60 @@ def test_run_id_consistent_across_max_workers_4_and_differs_between_runs(tmp_pat
     assert first_run_ids != second_run_ids  # consecutive runs never reuse a run_id
 
 
-def test_jsonl_event_count_matches_console_event_count(tmp_path, caplog):
+def test_jsonl_event_count_matches_console_event_count(tmp_path, caplog, moktan_logger_state):
     """§9-7 (latter half, previously untested): the JSON Lines sink and the
-    console sink must see the same number of events for the same run."""
+    console sink must see the same number of events for the same run.
+
+    Uses the shared moktan_logger_state fixture (rev5 §2.1) instead of a
+    hand-rolled teardown that stripped every handler -- that variant had
+    drifted from the snapshot/diff fix rev4 §2.1 applied in test_events.py,
+    reintroducing the exact cross-test order-dependence that fix closed."""
     from moktan.events import configure_logging
 
     _capture(caplog)
     users_raw, orders_raw, orders_clean, joined = _four_node_dag(tmp_path)
 
+    logger = moktan_logger_state
     json_path = tmp_path / "moktan.jsonl"
     configure_logging(json_path=json_path, console=False)
-    try:
-        run(joined, max_workers=1)
-        for handler in logging.getLogger("moktan").handlers:
-            handler.flush()
-    finally:
-        logger = logging.getLogger("moktan")
-        for handler in list(logger.handlers):
-            logger.removeHandler(handler)
-            handler.close()
-        logger.setLevel(logging.NOTSET)
+    run(joined, max_workers=1)
+    for handler in logger.handlers:
+        handler.flush()
 
     console_events = _events(caplog)
     jsonl_lines = json_path.read_text().strip().splitlines()
     assert len(jsonl_lines) == len(console_events)
     for line in jsonl_lines:
         json.loads(line)  # each line independently parses
+
+
+def test_jsonl_stays_valid_when_a_broken_sink_triggers_a_fallback_warning(
+    tmp_path, moktan_logger_state
+):
+    """rev5 §1.2: _dispatch's best-effort "a sink failed" warning (§1.1) is a
+    plain stdlib record with no moktan_event attached. Before this fix,
+    _JSONFormatter fell back to plain-text formatting for such records,
+    writing a non-JSON line into the configured JSON Lines file -- breaking
+    the §6.2 contract that every line independently parses with json.loads,
+    on exactly the run where a sink already misbehaved."""
+    from moktan.events import configure_logging
+
+    logger = moktan_logger_state
+    json_path = tmp_path / "moktan.jsonl"
+    configure_logging(json_path=json_path, console=False, level=logging.WARNING)
+
+    node = Node(tmp_path / "a.parquet", lambda: pl.DataFrame({"x": [1]}))
+    broken = RunRecorder(events=_AppendFailsForEvent("run_finished"))
+    with broken.attach():
+        run(node, max_workers=1)
+    for handler in logger.handlers:
+        handler.flush()
+
+    lines = json_path.read_text().strip().splitlines()
+    assert len(lines) == 1  # only the fallback warning is at WARNING+
+    payload = json.loads(lines[0])  # must not raise
+    assert payload["event"] == "log_message"
+    assert "run_finished" in payload["message"]
 
 
 def test_write_report_round_trips_to_markdown(tmp_path):
@@ -512,33 +540,68 @@ class _AppendFailsForEvent(list):
         super().append(item)
 
 
-def test_run_finished_emission_failure_does_not_fail_a_successful_run(tmp_path, caplog):
-    """§1.1 (rev4): if emitting run_finished itself fails (e.g. a broken
-    custom RunRecorder-like sink), the pipeline's own success must not be
-    discarded -- run() still returns the correct df, no exception escapes,
-    and a best-effort warning is logged instead of run_started dangling
-    unpaired with neither run_finished nor run_failed."""
-    from moktan.events import _register, _unregister
-
-    class _Sink:
-        def __init__(self) -> None:
-            self.events: list[dict] = _AppendFailsForEvent("run_finished")
-
+@pytest.mark.parametrize(
+    "target_event", ["run_started", "plan_computed", "node_planned", "node_computed", "run_finished"]
+)
+def test_broken_sink_does_not_affect_a_successful_run(tmp_path, caplog, target_event):
+    """rev5 §1.1 (root fix, not a per-site patch): a sink whose .events.append
+    raises must never affect what run() returns, no matter which of the
+    emission sites it chokes on -- rev4 only protected run_finished; this
+    parametrization covers every site a successful single-node run reaches.
+    A healthy sink registered alongside the broken one must still receive the
+    complete, correctly-paired event stream (no starvation, no dangling
+    run_started), and exactly one warning is logged naming the broken event."""
+    caplog.set_level(logging.WARNING, logger="moktan")
     node = Node(tmp_path / "a.parquet", lambda: pl.DataFrame({"x": [1]}))
 
-    sink = _Sink()
-    caplog.set_level(logging.WARNING, logger="moktan")
-    _register(sink)
-    try:
+    broken = RunRecorder(events=_AppendFailsForEvent(target_event))
+    healthy = RunRecorder()
+    with broken.attach(), healthy.attach():
         df = run(node, max_workers=1)
-    finally:
-        _unregister(sink)
 
     assert df["x"].to_list() == [1]  # the pipeline itself succeeded
+
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
-    assert "run_finished could not be emitted" in warnings[0].getMessage()
-    # run_started (and everything before the broken emit) still reached the
-    # sink normally -- only run_finished's append blew up.
-    assert any(e["event"] == "run_started" for e in sink.events)
-    assert not any(e["event"] == "run_finished" for e in sink.events)
+    assert target_event in warnings[0].getMessage()
+
+    assert not any(e["event"] == target_event for e in broken.events)
+    healthy_names = [e["event"] for e in healthy.events]
+    assert healthy_names == [
+        "run_started",
+        "plan_computed",
+        "node_planned",
+        "node_computed",
+        "run_finished",
+    ]
+
+
+@pytest.mark.parametrize(
+    "target_event", ["run_started", "plan_computed", "node_planned", "node_failed", "run_failed"]
+)
+def test_broken_sink_does_not_affect_a_failing_run(tmp_path, caplog, target_event):
+    """rev5 §1.1: same guarantee as above, on the failure path -- a broken
+    sink must not change PipelineError into some other exception (it would if
+    _emit_run_failed's own emission raised through an unprotected dispatch),
+    and run_started must still pair with run_failed even though a sink choked
+    partway through."""
+    caplog.set_level(logging.WARNING, logger="moktan")
+
+    def make_bad() -> pl.DataFrame:
+        raise RuntimeError("boom")
+
+    node = Node(tmp_path / "a.parquet", make_bad)
+
+    broken = RunRecorder(events=_AppendFailsForEvent(target_event))
+    healthy = RunRecorder()
+    with broken.attach(), healthy.attach(), pytest.raises(PipelineError) as exc_info:
+        run(node, force=True, max_workers=1)
+    assert exc_info.value.node is node
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert target_event in warnings[0].getMessage()
+
+    assert not any(e["event"] == target_event for e in broken.events)
+    healthy_names = [e["event"] for e in healthy.events]
+    assert healthy_names == ["run_started", "plan_computed", "node_planned", "node_failed", "run_failed"]

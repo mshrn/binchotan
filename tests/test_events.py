@@ -175,8 +175,32 @@ def test_legacy_verb_console_line_escapes_newline_in_node_path(caplog_moktan, ct
     _emit(ctx, "node_skipped", logging.INFO, node=node)
     message = _sole_message(caplog_moktan)
     assert "\n" not in message
+    escaped_path = str(node.path).replace("\n", "\\n")
+    assert message == f"skipped {escaped_path} thread=MainThread run_id={ctx.run_id}"
+
+
+def test_legacy_verb_console_line_escapes_carriage_return_in_node_path(caplog_moktan, ctx, tmp_path):
+    """rev5 §1.3: a bare `\\r` breaks the one-event-one-line console contract
+    exactly like `\\n` does (splitlines() treats it as a line break too), but
+    rev4's fix only neutralized `\\n` -- this covers the sibling character."""
+    node = Node(tmp_path / "weird\rname.parquet", lambda: pl.DataFrame())
+    _emit(ctx, "node_skipped", logging.INFO, node=node)
+    message = _sole_message(caplog_moktan)
+    assert "\r" not in message
+    escaped_path = str(node.path).replace("\r", "\\r")
+    assert message == f"skipped {escaped_path} thread=MainThread run_id={ctx.run_id}"
+
+
+def test_node_failed_console_line_escapes_carriage_return_in_message(caplog_moktan, ctx, tmp_path):
+    """rev5 §1.3: `_needs_quoting` only checked for `\\n`, so a scalar field
+    (e.g. a node_failed message) containing a bare `\\r` rendered unquoted
+    with a literal CR still breaking the one-line contract."""
+    node = Node(tmp_path / "orders_clean.parquet", lambda: pl.DataFrame())
+    _emit(ctx, "node_failed", logging.ERROR, node=node, error="RuntimeError", message="a\rb")
+    message = _sole_message(caplog_moktan)
+    assert "\r" not in message
     assert message == (
-        f"skipped {str(node.path).replace(chr(10), chr(92) + 'n')} "
+        f'node_failed node={node.path} error=RuntimeError message="a\\rb" '
         f"thread=MainThread run_id={ctx.run_id}"
     )
 
@@ -201,6 +225,27 @@ def test_node_planned_console_line_escapes_quotes_and_newlines_in_deps(caplog_mo
     assert message == (
         f"node_planned node={node.path} decision=compute reason=dep_stale "
         'deps=["out/weird\\"raw\\n.parquet"] thread=MainThread run_id=' + ctx.run_id
+    )
+
+
+def test_node_planned_console_line_escapes_carriage_return_in_deps(caplog_moktan, ctx, tmp_path):
+    """rev5 §1.3: the same `\\r` gap applied to list elements via the shared
+    `_needs_quoting` predicate."""
+    node = Node(tmp_path / "orders_clean.parquet", lambda: pl.DataFrame())
+    _emit(
+        ctx,
+        "node_planned",
+        logging.DEBUG,
+        node=node,
+        decision="compute",
+        reason="dep_stale",
+        deps=["out/weird\rraw.parquet"],
+    )
+    message = _sole_message(caplog_moktan)
+    assert "\r" not in message
+    assert message == (
+        f"node_planned node={node.path} decision=compute reason=dep_stale "
+        'deps=["out/weird\\rraw.parquet"] thread=MainThread run_id=' + ctx.run_id
     )
 
 
@@ -333,28 +378,20 @@ def test_run_id_is_12_hex_chars_and_unique_per_run():
     assert a != b
 
 
-def test_configure_logging_json_lines_output(tmp_path, ctx):
-    """§2.1 (rev4): snapshot/diff the logger's handlers rather than assuming
-    it starts empty -- events.py installs a permanent NullHandler at import
-    time, and the teardown here must not sweep that up (it would make other
-    tests order-dependent on this one having run first)."""
+def test_configure_logging_json_lines_output(tmp_path, ctx, moktan_logger_state):
+    """§2.1 (rev4/rev5): uses the shared moktan_logger_state fixture (rather
+    than assuming the logger starts empty) so teardown never sweeps up the
+    permanent NullHandler events.py installs at import time -- that would
+    make other tests order-dependent on this one having run first."""
     from moktan.events import configure_logging
 
-    logger = logging.getLogger("moktan")
-    handlers_before = set(logger.handlers)
-
+    logger = moktan_logger_state
     json_path = tmp_path / "moktan.jsonl"
     configure_logging(json_path=json_path, console=False)
-    try:
-        node = Node(tmp_path / "a.parquet", lambda: pl.DataFrame())
-        _emit(ctx, "node_computed", logging.INFO, node=node, duration_s=0.1, rows=1, columns=1, bytes=1)
-        for handler in logger.handlers:
-            handler.flush()
-    finally:
-        for handler in set(logger.handlers) - handlers_before:
-            logger.removeHandler(handler)
-            handler.close()
-        logger.setLevel(logging.NOTSET)  # configure_logging() sets it; don't leak to other tests
+    node = Node(tmp_path / "a.parquet", lambda: pl.DataFrame())
+    _emit(ctx, "node_computed", logging.INFO, node=node, duration_s=0.1, rows=1, columns=1, bytes=1)
+    for handler in logger.handlers:
+        handler.flush()
 
     lines = json_path.read_text().strip().splitlines()
     assert len(lines) == 1
@@ -364,38 +401,33 @@ def test_configure_logging_json_lines_output(tmp_path, ctx):
     assert payload["run_id"] == ctx.run_id
 
 
-def test_configure_logging_is_idempotent(tmp_path, ctx):
+def test_configure_logging_is_idempotent(tmp_path, ctx, moktan_logger_state):
     """§1.5 (rev3): calling configure_logging() twice must replace, not
     stack, handlers -- otherwise every event prints/writes N times.
 
-    §2.1 (rev4): counts handlers relative to a before-snapshot, not an
-    absolute "== 1", so this doesn't depend on whether some earlier test
-    left the permanent NullHandler (installed at import, events.py) in
-    place or already stripped it -- this test previously only passed by
-    accident of file-level test ordering (verified: failed when run alone).
+    §2.1 (rev4/rev5): counts handlers relative to a before-snapshot (the
+    shared moktan_logger_state fixture), not an absolute "== 1", so this
+    doesn't depend on whether some earlier test left the permanent
+    NullHandler (installed at import, events.py) in place or already
+    stripped it -- this test previously only passed by accident of
+    file-level test ordering (verified: failed when run alone).
     """
     from moktan.events import configure_logging
 
+    logger = moktan_logger_state
     json_path = tmp_path / "moktan.jsonl"
-    logger = logging.getLogger("moktan")
     handlers_before = set(logger.handlers)
-    try:
-        configure_logging(json_path=json_path, console=False)
-        configure_logging(json_path=json_path, console=False)  # re-configure, same target
-        assert len(set(logger.handlers) - handlers_before) == 1
+    configure_logging(json_path=json_path, console=False)
+    configure_logging(json_path=json_path, console=False)  # re-configure, same target
+    assert len(set(logger.handlers) - handlers_before) == 1
 
-        node = Node(tmp_path / "a.parquet", lambda: pl.DataFrame())
-        _emit(ctx, "node_computed", logging.INFO, node=node, duration_s=0.1, rows=1, columns=1, bytes=1)
-        for handler in logger.handlers:
-            handler.flush()
+    node = Node(tmp_path / "a.parquet", lambda: pl.DataFrame())
+    _emit(ctx, "node_computed", logging.INFO, node=node, duration_s=0.1, rows=1, columns=1, bytes=1)
+    for handler in logger.handlers:
+        handler.flush()
 
-        lines = json_path.read_text().strip().splitlines()
-        assert len(lines) == 1  # not 2
-    finally:
-        for handler in set(logger.handlers) - handlers_before:
-            logger.removeHandler(handler)
-            handler.close()
-        logger.setLevel(logging.NOTSET)
+    lines = json_path.read_text().strip().splitlines()
+    assert len(lines) == 1  # not 2
 
 
 def test_library_is_silent_without_configure_logging(capsys, ctx, tmp_path):

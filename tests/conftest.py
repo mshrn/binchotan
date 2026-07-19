@@ -5,13 +5,34 @@ from __future__ import annotations
 import logging
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import polars as pl
+import pytest
 
 from moktan.events import moktan_event as _moktan_event
 from moktan.node import Node
+
+
+@pytest.fixture
+def moktan_logger_state() -> Iterator[logging.Logger]:
+    """For a test that calls ``configure_logging()``: yields the ``"moktan"``
+    logger, then restores exactly what the test itself added -- removing and
+    closing only handlers not present in the before-snapshot, and resetting
+    the level. events.py installs a permanent ``NullHandler`` at import time;
+    a teardown that strips *all* handlers (rather than diffing against a
+    snapshot) sweeps that up too and makes other tests order-dependent on
+    whether this one ran first (rev4 §2.1, recurred at a second call site in
+    rev5 §2.1 before being centralized here)."""
+    logger = logging.getLogger("moktan")
+    handlers_before = set(logger.handlers)
+    yield logger
+    for handler in set(logger.handlers) - handlers_before:
+        logger.removeHandler(handler)
+        handler.close()
+    logger.setLevel(logging.NOTSET)
 
 
 def assert_subprocess_silent(script: str) -> None:
