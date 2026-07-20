@@ -12,7 +12,7 @@ import re
 import polars as pl
 import pytest
 
-from conftest import MOKTAN_TIMESTAMP_RE, AppendFailsForEvent, assert_subprocess_silent, moktan_warnings
+from conftest import MOKTAN_TIMESTAMP_RE, AppendFailsForEvent, assert_subprocess_silent
 from moktan import PipelineError, RunRecorder, run
 from moktan.events import _LINE_BREAK_ESCAPES, RunContext, _emit, _register, _unregister
 from moktan.events import moktan_event as _raw_moktan_event
@@ -565,18 +565,6 @@ def test_broken_sink_plus_broken_filter_does_not_fail_a_successful_run(
     ]
 
 
-def test_sink_failure_warning_names_the_sink_type(tmp_path, caplog):
-    """§2.1 (rev6): シンク失敗 warning は「どのシンクが」を型名で含む
-    (rev5 doc が明記した深さ)。イベント名も引き続き含む。"""
-    caplog.set_level(logging.WARNING, logger="moktan")
-    node = Node(tmp_path / "a.parquet", lambda: pl.DataFrame({"x": [1]}))
-    broken = RunRecorder(events=AppendFailsForEvent("run_finished"))
-
-    with broken.attach():
-        run(node, max_workers=1)
-
-    warnings = moktan_warnings(caplog)
-    assert len(warnings) == 1
-    message = warnings[0].getMessage()
-    assert "RunRecorder" in message  # type(sink).__name__
-    assert "run_finished" in message
+# §2.1 (rev6) の「シンク失敗 warning はシンク型名を含む」契約は、
+# test_logging_examples.py の _assert_broken_sink_isolated が全パラメトライズ
+# ケースでピンする(rev7 レビューで単発テストから統合)。

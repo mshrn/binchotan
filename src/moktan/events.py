@@ -125,8 +125,8 @@ _LINE_BREAK_ESCAPES: dict[str, str] = {
     "\x1d": "\\x1d",
     "\x1e": "\\x1e",
     "\x85": "\\x85",
-    "\u2028": "\\u2028",
-    "\u2029": "\\u2029",
+    "\u2028": "\\u2028",  # \u30bd\u30fc\u30b9\u4e0a\u306f\u5fc5\u305a\u3053\u306e ASCII \u30a8\u30b9\u30b1\u30fc\u30d7\u8868\u8a18\u3067\u66f8\u304f
+    "\u2029": "\\u2029",  # \u540c\u4e0a(\u751f\u306e\u4e0d\u53ef\u8996\u6587\u5b57\u3092\u57cb\u3081\u8fbc\u307e\u306a\u3044 -- rev7 \u00a71.2)
 }
 
 _QUOTE_TRIGGERS: tuple[str, ...] = (" ", '"', "=", *_LINE_BREAK_ESCAPES)

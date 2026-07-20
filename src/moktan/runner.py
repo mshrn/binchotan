@@ -62,13 +62,13 @@ def run(root: Node, *, force: bool = False, max_workers: int = 1) -> pl.DataFram
     ``run_started`` onward that can affect whether the *pipeline* succeeds is
     wrapped so any exception -- not just ``PipelineError`` -- closes the run
     with ``run_failed``. Event emission never raises (KeyboardInterrupt/
-    SystemExit excepted): broken sinks are isolated per-event in
+    SystemExit excepted): even the stringification of user exceptions into
+    event fields goes through ``events._safe_str`` so a broken ``__str__``
+    cannot replace ``PipelineError``; broken sinks are isolated per-event in
     ``events._dispatch`` (with a warning), and a broken application-side
     logging setup on the "moktan" logger is silently dropped inside
-    ``events._emit`` -- even the stringification of user exceptions into
-    event fields goes through ``events._safe_str`` so a broken ``__str__``
-    cannot replace ``PipelineError``; so only genuine pipeline failure
-    determines which closing event (``run_finished`` / ``run_failed``) fires.
+    ``events._emit`` -- so only genuine pipeline failure determines which
+    closing event (``run_finished`` / ``run_failed``) fires.
     """
     if max_workers < 1:
         raise ValueError(f"max_workers must be >= 1, got {max_workers}")

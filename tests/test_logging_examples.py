@@ -553,6 +553,9 @@ def _assert_broken_sink_isolated(
     warnings = moktan_warnings(caplog)
     assert len(warnings) == 1
     assert target_event in warnings[0].getMessage()
+    # rev6 §2.1 (consolidated here in rev7 review): the warning names WHICH
+    # sink broke, by type name -- pinned across all parametrized cases.
+    assert type(broken).__name__ in warnings[0].getMessage()
 
     assert [e["event"] for e in broken.events] == [
         e for e in expected_sequence if e != target_event
