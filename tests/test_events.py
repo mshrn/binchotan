@@ -13,7 +13,7 @@ import polars as pl
 import pytest
 
 from conftest import assert_subprocess_silent
-from moktan.events import RunContext, _emit, _register, _unregister
+from moktan.events import _LINE_BREAK_ESCAPES, RunContext, _emit, _register, _unregister
 from moktan.node import Node
 
 
@@ -166,28 +166,22 @@ def test_console_value_quoted_when_it_contains_bare_equals(caplog_moktan, ctx, t
     )
 
 
-def test_legacy_verb_console_line_escapes_newline_in_node_path(caplog_moktan, ctx, tmp_path):
-    """§1.2 (rev4): a node path is spliced bare into the legacy-verb head
-    (unlike other fields, it can't be wrapped in quotes without breaking the
-    split()[:2] back-compat contract), so a literal newline in it must still
-    be neutralized to preserve the one-event-one-line console contract."""
-    node = Node(tmp_path / "weird\nname.parquet", lambda: pl.DataFrame())
+@pytest.mark.parametrize("raw,escaped", list(_LINE_BREAK_ESCAPES.items()))
+def test_legacy_verb_console_line_escapes_line_breaks_in_node_path(
+    caplog_moktan, ctx, tmp_path, raw, escaped
+):
+    """§1.2 (rev4) / rev5 §1.3 / rev6 §1.4: a node path is spliced bare into
+    the legacy-verb head (unlike other fields, it can't be wrapped in quotes
+    without breaking the split()[:2] back-compat contract), so any character
+    str.splitlines() treats as a line break must still be neutralized to
+    preserve the one-event-one-line console contract. Parametrized directly
+    over _LINE_BREAK_ESCAPES so a future addition to that dict is
+    automatically exercised here instead of needing a new clone test."""
+    node = Node(tmp_path / f"weird{raw}name.parquet", lambda: pl.DataFrame())
     _emit(ctx, "node_skipped", logging.INFO, node=node)
     message = _sole_message(caplog_moktan)
-    assert "\n" not in message
-    escaped_path = str(node.path).replace("\n", "\\n")
-    assert message == f"skipped {escaped_path} thread=MainThread run_id={ctx.run_id}"
-
-
-def test_legacy_verb_console_line_escapes_carriage_return_in_node_path(caplog_moktan, ctx, tmp_path):
-    """rev5 §1.3: a bare `\\r` breaks the one-event-one-line console contract
-    exactly like `\\n` does (splitlines() treats it as a line break too), but
-    rev4's fix only neutralized `\\n` -- this covers the sibling character."""
-    node = Node(tmp_path / "weird\rname.parquet", lambda: pl.DataFrame())
-    _emit(ctx, "node_skipped", logging.INFO, node=node)
-    message = _sole_message(caplog_moktan)
-    assert "\r" not in message
-    escaped_path = str(node.path).replace("\r", "\\r")
+    assert raw not in message
+    escaped_path = str(node.path).replace(raw, escaped)
     assert message == f"skipped {escaped_path} thread=MainThread run_id={ctx.run_id}"
 
 
@@ -346,26 +340,23 @@ def test_emit_dispatches_full_event_dict_to_registered_sinks(ctx, tmp_path):
     assert re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$", event["timestamp"])
 
 
-def test_recorder_dispatch_is_independent_of_logging_level(ctx, tmp_path):
+def test_recorder_dispatch_is_independent_of_logging_level(ctx, tmp_path, moktan_logger_state):
     """RunRecorder-style sinks must receive DEBUG events even when the stdlib
     logger is configured above DEBUG (spec §2)."""
-    logging.getLogger("moktan").setLevel(logging.ERROR)
+    moktan_logger_state.setLevel(logging.ERROR)
+    sink_events: list[dict] = []
+
+    class _Sink:
+        events = sink_events
+
+    sink = _Sink()
+    _register(sink)
     try:
-        sink_events: list[dict] = []
-
-        class _Sink:
-            events = sink_events
-
-        sink = _Sink()
-        _register(sink)
-        try:
-            node = Node(tmp_path / "x.parquet", lambda: pl.DataFrame())
-            _emit(ctx, "node_planned", logging.DEBUG, node=node, decision="load", reason="fresh", deps=[])
-        finally:
-            _unregister(sink)
-        assert len(sink_events) == 1
+        node = Node(tmp_path / "x.parquet", lambda: pl.DataFrame())
+        _emit(ctx, "node_planned", logging.DEBUG, node=node, decision="load", reason="fresh", deps=[])
     finally:
-        logging.getLogger("moktan").setLevel(logging.NOTSET)
+        _unregister(sink)
+    assert len(sink_events) == 1
 
 
 def test_run_id_is_12_hex_chars_and_unique_per_run():

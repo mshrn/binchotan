@@ -79,9 +79,13 @@ def assert_subprocess_silent(script: str) -> None:
 
 def moktan_event(record: logging.LogRecord) -> dict[str, Any]:
     """Non-optional wrapper around ``moktan.events.moktan_event`` for tests:
-    every record captured in these test files was emitted by moktan, so a
-    ``None`` here means the test itself is broken -- fail loudly rather than
-    propagating ``Optional`` through every caller."""
+    intended for records known to be moktan *events* (a ``None`` here means
+    the test itself is broken -- fail loudly rather than propagating
+    ``Optional`` through every caller). Not every record on the "moktan"
+    logger is an event, though: ``events._dispatch``'s best-effort
+    broken-sink warning is a plain record with no event payload. A test that
+    maps this helper over a captured-records list containing such a record
+    (e.g. a broken-sink scenario) must filter it out first."""
     event = _moktan_event(record)
     assert event is not None, "record was not emitted by moktan"
     return event

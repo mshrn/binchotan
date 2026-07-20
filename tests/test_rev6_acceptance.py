@@ -50,7 +50,6 @@ class _RaisesOnPlainRecords(logging.Filter):
         return True
 
 
-@pytest.mark.xfail(strict=True, reason="rev6 §1.1: _emit の stdlib 経路が無保護")
 def test_broken_app_filter_does_not_fail_a_successful_run(tmp_path, moktan_logger_state):
     """§1.1-a: 壊れた Filter を "moktan" ロガーに付けても、成功する run() は
     df を返し、例外は漏れず、シンク(Filter と無関係な経路)は全イベントを受け取る。"""
@@ -76,7 +75,6 @@ def test_broken_app_filter_does_not_fail_a_successful_run(tmp_path, moktan_logge
     ]
 
 
-@pytest.mark.xfail(strict=True, reason="rev6 §1.1: _emit の stdlib 経路が無保護")
 def test_broken_app_filter_does_not_replace_pipeline_error(tmp_path, moktan_logger_state):
     """§1.1-b: 壊れた Filter があっても、失敗する run() の呼び出し元に見える例外は
     PipelineError のまま(Filter の例外に置換されない)。"""
@@ -97,7 +95,6 @@ def test_broken_app_filter_does_not_replace_pipeline_error(tmp_path, moktan_logg
     assert exc_info.value.node is node
 
 
-@pytest.mark.xfail(strict=True, reason="rev6 §1.1: _dispatch のシンク失敗 warning 自体が無保護")
 def test_broken_sink_plus_broken_filter_does_not_fail_a_successful_run(
     tmp_path, moktan_logger_state
 ):
@@ -126,7 +123,6 @@ def test_broken_sink_plus_broken_filter_does_not_fail_a_successful_run(
     ]
 
 
-@pytest.mark.xfail(strict=True, reason="rev6 §2.1: warning にシンクの型名が入っていない")
 def test_sink_failure_warning_names_the_sink_type(tmp_path, caplog):
     """§2.1: シンク失敗 warning は「どのシンクが」を型名で含む
     (rev5 doc が明記した深さ)。イベント名も引き続き含む。"""
@@ -144,7 +140,6 @@ def test_sink_failure_warning_names_the_sink_type(tmp_path, caplog):
     assert "run_finished" in message
 
 
-@pytest.mark.xfail(strict=True, reason="rev6 §2.2: フォールバック行に timestamp/run_id がない")
 def test_jsonl_fallback_line_has_timestamp_and_run_id(tmp_path, moktan_logger_state):
     """§2.2: _JSONFormatter のフォールバック行(event=log_message)にも、通常行と
     同形式の timestamp と、発行元の run_id が入る。"""
@@ -168,7 +163,6 @@ def test_jsonl_fallback_line_has_timestamp_and_run_id(tmp_path, moktan_logger_st
     assert payload["run_id"] == broken.events[0]["run_id"]
 
 
-@pytest.mark.xfail(strict=True, reason="rev6 §3.1: splitlines 文字集合の残り8文字が未エスケープ")
 @pytest.mark.parametrize("ch", _EXOTIC_LINE_BREAKERS)
 def test_scalar_field_with_exotic_line_breaker_stays_one_line(caplog, ch):
     """§3.1(スカラ位置): \\n・\\r 以外の splitlines 行区切り文字を含む message も
@@ -183,7 +177,6 @@ def test_scalar_field_with_exotic_line_breaker_stays_one_line(caplog, ch):
     assert len(message.splitlines()) == 1
 
 
-@pytest.mark.xfail(strict=True, reason="rev6 §3.1: splitlines 文字集合の残り8文字が未エスケープ")
 @pytest.mark.parametrize("ch", _EXOTIC_LINE_BREAKERS)
 def test_bare_token_path_with_exotic_line_breaker_stays_one_line(caplog, tmp_path, ch):
     """§3.1(裸トークン位置): legacy verb の path に同文字が入っても 1 行を保つ。"""

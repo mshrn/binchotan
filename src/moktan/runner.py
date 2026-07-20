@@ -61,12 +61,12 @@ def run(root: Node, *, force: bool = False, max_workers: int = 1) -> pl.DataFram
     run never started, so it gets no events at all), and everything from
     ``run_started`` onward that can affect whether the *pipeline* succeeds is
     wrapped so any exception -- not just ``PipelineError`` -- closes the run
-    with ``run_failed``. Event emission itself never raises due to a broken
-    sink: a sink whose ``.events.append()`` raises is caught and warned about
-    per-event inside ``events._dispatch`` (rev5 §1.1), so no ``_emit`` call
-    anywhere in this function can turn pipeline success into ``run_failed``,
-    or leave ``run_started`` dangling unpaired -- only a genuine pipeline
-    failure changes which of the two closing events fires.
+    with ``run_failed``. Event emission never raises (KeyboardInterrupt/
+    SystemExit excepted): broken sinks are isolated per-event in
+    ``events._dispatch`` (with a warning), and a broken application-side
+    logging setup on the "moktan" logger is silently dropped inside
+    ``events._emit`` -- so only genuine pipeline failure determines which
+    closing event (``run_finished`` / ``run_failed``) fires.
     """
     if max_workers < 1:
         raise ValueError(f"max_workers must be >= 1, got {max_workers}")
@@ -98,10 +98,8 @@ def run(root: Node, *, force: bool = False, max_workers: int = 1) -> pl.DataFram
         )
 
         if _listening(logging.DEBUG):
-            # Skip building a deps=[...] list (a Path-to-str conversion per
-            # edge) for every node when nobody could observe node_planned
-            # anyway -- same guard _emit itself uses internally, hoisted here
-            # so the per-node work is skipped too, not just the emission.
+            # Hoisted copy of _emit's own guard so the per-node deps list
+            # isn't built when nobody is listening.
             for node in graph.order:
                 _emit(
                     ctx,

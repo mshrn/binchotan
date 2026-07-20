@@ -1,7 +1,9 @@
 """Structured event emission: the single source of truth for run observability.
 
-``_emit`` is the only place moktan writes log output (flume_logging_spec.md §2).
-It fans out to two independent consumers:
+``_emit`` is the only place moktan emits *events*; the sole other write to the
+"moktan" logger is ``_dispatch``'s best-effort broken-sink warning (a plain
+record, handled by ``_JSONFormatter``'s fallback). It fans out to two
+independent consumers:
 
 - the stdlib ``"moktan"`` logger, via a private structlog-wrapped logger. This is
   subject to normal ``logging`` configuration (level, handlers) -- silent unless
@@ -71,6 +73,10 @@ def new_run_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
+def _iso_timestamp(dt: datetime) -> str:
+    return dt.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
 # --- console rendering (§6.1) -----------------------------------------------
 
 # The 3 pre-existing verbs keep their bare "<verb> <path>" first two tokens
@@ -91,9 +97,25 @@ def _format_duration(value: float) -> str:
 # Single source of truth for "which characters break the one-event-one-line
 # console contract" (rev5 §1.3: `_needs_quoting` and the bare-token escape
 # below used to each hardcode `\n` separately, and both silently missed `\r`
-# as a result -- a lone carriage return still split a line for the same
-# reason `\n` does).
-_LINE_BREAK_ESCAPES: dict[str, str] = {"\n": "\\n", "\r": "\\r"}
+# as a result). rev6 §1.4: the rationale is "protect splitlines()-based
+# consumers", so the set covers every character str.splitlines() treats as a
+# line boundary, not just \n/\r. Quoted positions are safe once _needs_quoting
+# triggers (json.dumps escapes all control chars and, with ensure_ascii=True,
+# all non-ASCII); the bare-token position uses the explicit escape text below.
+_LINE_BREAK_ESCAPES: dict[str, str] = {
+    "\n": "\\n",
+    "\r": "\\r",
+    "\v": "\\x0b",
+    "\f": "\\x0c",
+    "\x1c": "\\x1c",
+    "\x1d": "\\x1d",
+    "\x1e": "\\x1e",
+    "\x85": "\\x85",
+    " ": "\\u2028",
+    " ": "\\u2029",
+}
+
+_QUOTE_TRIGGERS: tuple[str, ...] = (" ", '"', "=", *_LINE_BREAK_ESCAPES)
 
 
 def _needs_quoting(value: str) -> bool:
@@ -101,7 +123,7 @@ def _needs_quoting(value: str) -> bool:
     # for `"`/a line-break character, the "one event, one line" console
     # contract itself) if left bare -- e.g. a node_failed message from
     # `str(exc)`.
-    return any(c in value for c in (" ", '"', "=", *_LINE_BREAK_ESCAPES))
+    return any(c in value for c in _QUOTE_TRIGGERS)
 
 
 def _escape_bare_token(value: str) -> str:
@@ -214,34 +236,38 @@ def _dispatch(event: dict[str, Any]) -> None:
     for sink in sinks:
         try:
             sink.events.append(event)
-        except Exception as exc:  # noqa: BLE001 - deliberately broad, see below
-            # rev5 §1.1 (root fix for the recurring "same contract, N emission
-            # sites, one patched" bug class): a broken sink must never be able
-            # to affect what run() returns or raises, no matter which of the
-            # ~11 _emit call sites it chokes on -- isolating it here (instead
-            # of wrapping individual call sites in runner.py) makes that true
-            # by construction everywhere at once, and a broken sink no longer
-            # starves sinks registered after it in the loop. KeyboardInterrupt
-            # / SystemExit deliberately are NOT caught: an operator's Ctrl-C
-            # must still abort the run even if it lands inside a sink's
-            # .append().
-            logger.warning(
-                "moktan: a sink failed to record event %r (run_id=%s): %r",
-                event.get("event"),
-                event.get("run_id"),
-                exc,
-            )
+        except Exception as exc:  # noqa: BLE001 - sink isolation, see comment
+            # A broken sink must never be able to affect what run() returns or
+            # raises, no matter which _emit call site it chokes on -- isolating
+            # it here (instead of wrapping individual call sites in runner.py)
+            # makes that true by construction everywhere at once, and a broken
+            # sink no longer starves sinks registered after it in the loop.
+            # KeyboardInterrupt/SystemExit deliberately are NOT caught: an
+            # operator's Ctrl-C must still abort the run even if it lands
+            # inside a sink's .append().
+            try:
+                logger.warning(
+                    "moktan: sink %s failed to record event %r (run_id=%s): %r",
+                    type(sink).__name__,
+                    event.get("event"),
+                    event.get("run_id"),
+                    exc,
+                    extra={"moktan_run_id": event.get("run_id")},
+                )
+            except Exception:  # noqa: BLE001
+                # The warning channel itself (app logging config on the
+                # "moktan" logger) is broken too -- same reasoning as _emit's
+                # stdlib-path guard below: drop it.
+                pass
 
 
 # --- emission ----------------------------------------------------------------
 
 
 def _listening(level: int) -> bool:
-    """Would anything actually observe an event emitted at ``level`` right
-    now -- either a sink (which bypasses stdlib levels entirely, spec §2) or
-    the stdlib ``"moktan"`` logger itself? Shared by :func:`_emit`'s early
-    return and by callers (e.g. runner.py's node_planned loop) that want to
-    skip building expensive event fields before ever calling :func:`_emit`."""
+    """True if a sink is attached (sinks bypass stdlib levels, spec §2) or the
+    stdlib ``"moktan"`` logger would accept ``level``. Callers may use it to
+    skip building expensive event fields before calling :func:`_emit`."""
     return bool(_registry) or logger.isEnabledFor(level)
 
 
@@ -261,16 +287,26 @@ def _emit(
     ordered.update(fields)
     ordered["thread"] = threading.current_thread().name
     ordered["run_id"] = ctx.run_id
-    ordered["timestamp"] = datetime.now(UTC).isoformat(timespec="milliseconds").replace(
-        "+00:00", "Z"
-    )
+    ordered["timestamp"] = _iso_timestamp(datetime.now(UTC))
     _dispatch(dict(ordered))
     if logger.isEnabledFor(level):
         # A sink-only listener (RunRecorder attached, stdlib logger left
         # unconfigured) already got its event via _dispatch above; skip
         # rendering the console line and pushing it through structlog only to
         # have the stdlib logger discard it at its own level check.
-        _struct_logger.log(level, event, **{k: v for k, v in ordered.items() if k != "event"})
+        try:
+            _struct_logger.log(level, event, **{k: v for k, v in ordered.items() if k != "event"})
+        except Exception:  # noqa: BLE001
+            # A failure here means the application's logging setup on the
+            # "moktan" logger is broken (a raising Filter, a non-conforming
+            # Handler.emit -- stdlib's handleError only covers emit bodies
+            # that follow the try/except convention; Logger.filter() and a
+            # non-conforming Handler.handle() propagate their exceptions
+            # untouched). The notification channel itself is what failed, so
+            # there is nothing sane to notify through: drop it. Sinks already
+            # received the event via _dispatch above. KeyboardInterrupt/
+            # SystemExit still propagate.
+            pass
 
 
 def moktan_event(record: logging.LogRecord) -> dict[str, Any] | None:
@@ -297,14 +333,17 @@ class _JSONFormatter(logging.Formatter):
         # falling back to plain text: the §6.2 contract is "every line in the
         # file independently parses with json.loads", and that must hold even
         # on the one run where observability itself already hiccupped.
-        return json.dumps(
-            {
-                "event": "log_message",
-                "level": record.levelname,
-                "logger": record.name,
-                "message": record.getMessage(),
-            }
-        )
+        payload: dict[str, Any] = {
+            "event": "log_message",
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "timestamp": _iso_timestamp(datetime.fromtimestamp(record.created, UTC)),
+        }
+        run_id = getattr(record, "moktan_run_id", None)
+        if run_id is not None:
+            payload["run_id"] = run_id
+        return json.dumps(payload)
 
 
 _installed_handlers: list[logging.Handler] = []

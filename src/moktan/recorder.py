@@ -42,7 +42,12 @@ class RunRecorder:
     @contextmanager
     def attach(self) -> Iterator[RunRecorder]:
         """Register this recorder for the duration of the ``with`` block.
-        Nestable, and independent of any other attached recorder."""
+        Nestable, and independent of any other attached recorder.
+
+        Call this before ``run()`` starts. Attaching mid-run misses every
+        event already emitted (including the batch of ``node_planned``
+        events), so ``to_mermaid()``/``to_markdown()`` would render an
+        incomplete diagram/table."""
         _register(self)
         try:
             yield self
