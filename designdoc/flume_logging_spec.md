@@ -103,6 +103,8 @@ run 系イベントは `run started ...` でなく `run_started force=False max_
 
 JSON Lines には通常イベント行のほか、`"event": "log_message"` の内部診断行(シンク故障時の warning 等)が混ざりうる。診断行にも `timestamp`(同形式)は必ず含まれ、`run_id` は発行元が判明している場合のみ含まれる。各行が単独で json.loads 可能である契約は全行種で維持される。
 
+なお、アプリが "moktan" ロガーに取り付けた Filter やハンドラ自体が例外を投げる場合、moktan はその例外を握りつぶし、該当イベントのコンソール/JSON Lines 出力を静かにスキップする(通知チャネル自体が壊れているため通知しない設計。シンクへの配送とパイプラインの実行結果には影響しない)。「ハンドラを設定したのに moktan の行だけ消える」場合は、まず自分の Filter/Handler が moktan のレコードで例外を投げていないかを疑うこと。
+
 ## 7. RunRecorder と可視化
 
 `attach()` は run() の開始前に行うこと。実行中の run に途中から attach した場合、それ以前のイベント(一括発行される node_planned を含む)は記録されず、to_mermaid()/to_markdown() は不完全な図・表を返す。

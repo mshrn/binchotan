@@ -14,7 +14,7 @@ from queue import SimpleQueue
 
 import polars as pl
 
-from moktan.events import Decision, Reason, RunContext, _emit, _listening, new_run_id
+from moktan.events import Decision, Reason, RunContext, _emit, _listening, _safe_str, new_run_id
 from moktan.graph import Graph, build_graph
 from moktan.node import Node
 
@@ -65,8 +65,10 @@ def run(root: Node, *, force: bool = False, max_workers: int = 1) -> pl.DataFram
     SystemExit excepted): broken sinks are isolated per-event in
     ``events._dispatch`` (with a warning), and a broken application-side
     logging setup on the "moktan" logger is silently dropped inside
-    ``events._emit`` -- so only genuine pipeline failure determines which
-    closing event (``run_finished`` / ``run_failed``) fires.
+    ``events._emit`` -- even the stringification of user exceptions into
+    event fields goes through ``events._safe_str`` so a broken ``__str__``
+    cannot replace ``PipelineError``; so only genuine pipeline failure
+    determines which closing event (``run_finished`` / ``run_failed``) fires.
     """
     if max_workers < 1:
         raise ValueError(f"max_workers must be >= 1, got {max_workers}")
@@ -157,7 +159,7 @@ def _emit_run_failed(
             duration_s=duration_s,
             failed=failed,
             error=type(exc).__name__,
-            message=str(exc),
+            message=_safe_str(exc),
         )
     else:
         _emit(ctx, "run_failed", logging.ERROR, status="failed", duration_s=duration_s, failed=failed)
@@ -342,7 +344,7 @@ def _run_sequential(
             except Exception as exc:
                 _emit(
                     ctx, "node_failed", logging.ERROR, node=node,
-                    error=type(exc).__name__, message=str(exc),
+                    error=type(exc).__name__, message=_safe_str(exc),
                 )
                 raise PipelineError(node) from exc
             _finish_node(node, df, plan, cache, counts, root)
@@ -399,7 +401,7 @@ def _run_parallel(
                 if exc is not None:
                     _emit(
                         ctx, "node_failed", logging.ERROR, node=node,
-                        error=type(exc).__name__, message=str(exc),
+                        error=type(exc).__name__, message=_safe_str(exc),
                     )
                     failures.append((node, exc))
                     for other in pending:

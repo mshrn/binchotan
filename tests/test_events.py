@@ -12,8 +12,10 @@ import re
 import polars as pl
 import pytest
 
-from conftest import assert_subprocess_silent
+from conftest import MOKTAN_TIMESTAMP_RE, AppendFailsForEvent, assert_subprocess_silent, moktan_warnings
+from moktan import PipelineError, RunRecorder, run
 from moktan.events import _LINE_BREAK_ESCAPES, RunContext, _emit, _register, _unregister
+from moktan.events import moktan_event as _raw_moktan_event
 from moktan.node import Node
 
 
@@ -185,17 +187,36 @@ def test_legacy_verb_console_line_escapes_line_breaks_in_node_path(
     assert message == f"skipped {escaped_path} thread=MainThread run_id={ctx.run_id}"
 
 
-def test_node_failed_console_line_escapes_carriage_return_in_message(caplog_moktan, ctx, tmp_path):
-    """rev5 §1.3: `_needs_quoting` only checked for `\\n`, so a scalar field
-    (e.g. a node_failed message) containing a bare `\\r` rendered unquoted
-    with a literal CR still breaking the one-line contract."""
+@pytest.mark.parametrize("raw", list(_LINE_BREAK_ESCAPES))
+def test_scalar_field_line_breaks_render_as_json_quoted(caplog_moktan, ctx, tmp_path, raw):
+    """rev5 §1.3 / rev6 §1.4 / rev7 §2.1: any splitlines boundary char in a
+    scalar field triggers json.dumps quoting (independent oracle: json.dumps
+    itself), keeping the one-event-one-line contract. Parametrized over
+    _LINE_BREAK_ESCAPES so dict additions are exercised automatically."""
     node = Node(tmp_path / "orders_clean.parquet", lambda: pl.DataFrame())
-    _emit(ctx, "node_failed", logging.ERROR, node=node, error="RuntimeError", message="a\rb")
+    _emit(ctx, "node_failed", logging.ERROR, node=node, error="RuntimeError", message=f"a{raw}b")
     message = _sole_message(caplog_moktan)
-    assert "\r" not in message
+    assert raw not in message
+    assert len(message.splitlines()) == 1
     assert message == (
-        f'node_failed node={node.path} error=RuntimeError message="a\\rb" '
+        f"node_failed node={node.path} error=RuntimeError message={json.dumps(f'a{raw}b')} "
         f"thread=MainThread run_id={ctx.run_id}"
+    )
+
+
+@pytest.mark.parametrize("raw", list(_LINE_BREAK_ESCAPES))
+def test_deps_element_line_breaks_render_as_json_quoted(caplog_moktan, ctx, tmp_path, raw):
+    """rev7 §2.1: same contract for list elements (previously only \\n/\\r
+    were covered anywhere for the deps position)."""
+    node = Node(tmp_path / "orders_clean.parquet", lambda: pl.DataFrame())
+    _emit(ctx, "node_planned", logging.DEBUG, node=node, decision="compute",
+          reason="dep_stale", deps=[f"out/a{raw}b.parquet"])
+    message = _sole_message(caplog_moktan)
+    assert raw not in message
+    assert len(message.splitlines()) == 1
+    assert message == (
+        f"node_planned node={node.path} decision=compute reason=dep_stale "
+        f"deps=[{json.dumps(f'out/a{raw}b.parquet')}] thread=MainThread run_id={ctx.run_id}"
     )
 
 
@@ -219,27 +240,6 @@ def test_node_planned_console_line_escapes_quotes_and_newlines_in_deps(caplog_mo
     assert message == (
         f"node_planned node={node.path} decision=compute reason=dep_stale "
         'deps=["out/weird\\"raw\\n.parquet"] thread=MainThread run_id=' + ctx.run_id
-    )
-
-
-def test_node_planned_console_line_escapes_carriage_return_in_deps(caplog_moktan, ctx, tmp_path):
-    """rev5 §1.3: the same `\\r` gap applied to list elements via the shared
-    `_needs_quoting` predicate."""
-    node = Node(tmp_path / "orders_clean.parquet", lambda: pl.DataFrame())
-    _emit(
-        ctx,
-        "node_planned",
-        logging.DEBUG,
-        node=node,
-        decision="compute",
-        reason="dep_stale",
-        deps=["out/weird\rraw.parquet"],
-    )
-    message = _sole_message(caplog_moktan)
-    assert "\r" not in message
-    assert message == (
-        f"node_planned node={node.path} decision=compute reason=dep_stale "
-        'deps=["out/weird\\rraw.parquet"] thread=MainThread run_id=' + ctx.run_id
     )
 
 
@@ -337,7 +337,7 @@ def test_emit_dispatches_full_event_dict_to_registered_sinks(ctx, tmp_path):
     assert event["run_id"] == ctx.run_id
     assert event["duration_s"] == 0.1
     assert "timestamp" in event
-    assert re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$", event["timestamp"])
+    assert MOKTAN_TIMESTAMP_RE.match(event["timestamp"])
 
 
 def test_recorder_dispatch_is_independent_of_logging_level(ctx, tmp_path, moktan_logger_state):
@@ -471,3 +471,112 @@ def test_structlog_global_config_does_not_affect_moktan(caplog_moktan, ctx, tmp_
             assert len(caplog_moktan.records) == 1, wrapper_class
         finally:
             structlog.reset_defaults()
+
+
+class _AlwaysRaisingFilter(logging.Filter):
+    """アプリが "moktan" ロガーに取り付けた壊れた logging.Filter のモデル。
+    CPython の Logger.filter()/Handler.handle() は Filter の例外を一切吸収しない。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        raise RuntimeError("broken app filter")
+
+
+class _RaisesOnPlainRecords(logging.Filter):
+    """moktan 自身のイベントレコード(moktan_event 属性あり)は通すが、素のレコード
+    (_dispatch のシンク失敗 warning がまさにこれ)で raise する Filter。
+    「moktan のレコードだけ想定してアプリがフィルタを書いた」現実的なケースのモデル。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if _raw_moktan_event(record) is None:
+            raise RuntimeError("app filter chokes on non-event records")
+        return True
+
+
+def test_broken_app_filter_does_not_fail_a_successful_run(tmp_path, moktan_logger_state):
+    """§1.1-a (rev6): 壊れた Filter を "moktan" ロガーに付けても、成功する run() は
+    df を返し、例外は漏れず、シンク(Filter と無関係な経路)は全イベントを受け取る。"""
+    moktan_logger_state.setLevel(logging.DEBUG)  # stdlib 経路を確実に通す
+    broken_filter = _AlwaysRaisingFilter()
+    node = Node(tmp_path / "a.parquet", lambda: pl.DataFrame({"x": [1]}))
+    recorder = RunRecorder()
+
+    moktan_logger_state.addFilter(broken_filter)
+    try:
+        with recorder.attach():
+            df = run(node, max_workers=1)
+    finally:
+        moktan_logger_state.removeFilter(broken_filter)
+
+    assert df["x"].to_list() == [1]
+    assert [e["event"] for e in recorder.events] == [
+        "run_started",
+        "plan_computed",
+        "node_planned",
+        "node_computed",
+        "run_finished",
+    ]
+
+
+def test_broken_app_filter_does_not_replace_pipeline_error(tmp_path, moktan_logger_state):
+    """§1.1-b (rev6): 壊れた Filter があっても、失敗する run() の呼び出し元に見える例外は
+    PipelineError のまま(Filter の例外に置換されない)。"""
+    moktan_logger_state.setLevel(logging.DEBUG)
+    broken_filter = _AlwaysRaisingFilter()
+
+    def make_bad() -> pl.DataFrame:
+        raise RuntimeError("boom")
+
+    node = Node(tmp_path / "a.parquet", make_bad)
+
+    moktan_logger_state.addFilter(broken_filter)
+    try:
+        with pytest.raises(PipelineError) as exc_info:
+            run(node, force=True, max_workers=1)
+    finally:
+        moktan_logger_state.removeFilter(broken_filter)
+    assert exc_info.value.node is node
+
+
+def test_broken_sink_plus_broken_filter_does_not_fail_a_successful_run(
+    tmp_path, moktan_logger_state
+):
+    """§1.1-c (rev6): 壊れたシンク + 「素のレコードでだけ壊れる Filter」の複合。
+    シンク失敗を通知する warning(素のレコード)が Filter で raise しても、
+    run() の成否に影響しない。rev5 の分離機構自体の例外安全性を固定する。"""
+    moktan_logger_state.setLevel(logging.DEBUG)
+    plain_record_filter = _RaisesOnPlainRecords()
+    node = Node(tmp_path / "a.parquet", lambda: pl.DataFrame({"x": [1]}))
+    broken_sink = RunRecorder(events=AppendFailsForEvent("run_finished"))
+
+    moktan_logger_state.addFilter(plain_record_filter)
+    try:
+        with broken_sink.attach():
+            df = run(node, max_workers=1)
+    finally:
+        moktan_logger_state.removeFilter(plain_record_filter)
+
+    assert df["x"].to_list() == [1]
+    # シンクは run_finished 以外を通常どおり受け取っている
+    assert [e["event"] for e in broken_sink.events] == [
+        "run_started",
+        "plan_computed",
+        "node_planned",
+        "node_computed",
+    ]
+
+
+def test_sink_failure_warning_names_the_sink_type(tmp_path, caplog):
+    """§2.1 (rev6): シンク失敗 warning は「どのシンクが」を型名で含む
+    (rev5 doc が明記した深さ)。イベント名も引き続き含む。"""
+    caplog.set_level(logging.WARNING, logger="moktan")
+    node = Node(tmp_path / "a.parquet", lambda: pl.DataFrame({"x": [1]}))
+    broken = RunRecorder(events=AppendFailsForEvent("run_finished"))
+
+    with broken.attach():
+        run(node, max_workers=1)
+
+    warnings = moktan_warnings(caplog)
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "RunRecorder" in message  # type(sink).__name__
+    assert "run_finished" in message

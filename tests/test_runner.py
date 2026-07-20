@@ -9,7 +9,7 @@ import pytest
 
 from conftest import linear_three as _linear_three
 from conftest import moktan_event
-from moktan import Node, PipelineError, run
+from moktan import Node, PipelineError, RunRecorder, run
 
 
 def test_linear_three_nodes_recompute_then_skip(tmp_path):
@@ -323,3 +323,62 @@ def test_multiple_parallel_failures_report_all_nodes(tmp_path):
     assert set(err.__notes__) == {
         f"also failed: {node.path}" for node in bad_nodes if node is not err.node
     }
+
+
+class _BrokenStrError(RuntimeError):
+    """__str__ が壊れたユーザー例外のモデル。現実例: 別コンストラクタ経路で未設定の
+    属性を __str__ が参照する、フォーマットバグ等。"""
+
+    def __str__(self) -> str:
+        raise ValueError("broken __str__")
+
+
+def test_broken_str_exception_keeps_pipeline_error_sequential(tmp_path):
+    """§1.1-a(逐次)(rev7): ノード関数が __str__ の壊れた例外を投げても、呼び出し元に
+    見える例外は PipelineError のまま(str(exc) の評価失敗に置換されない)。
+    node_failed はフォールバック文字列 "<unprintable _BrokenStrError>" を message に
+    持って発行され、run_failed と §8 ペアリングも保たれる。ロギング設定は不要
+    (この経路は _listening の早期リターンより前、引数評価の時点で壊れていた)。"""
+
+    def bad() -> pl.DataFrame:
+        raise _BrokenStrError()
+
+    node = Node(tmp_path / "a.parquet", bad)
+    recorder = RunRecorder()
+    with recorder.attach(), pytest.raises(PipelineError) as exc_info:
+        run(node, force=True, max_workers=1)
+    assert exc_info.value.node is node
+
+    names = [e["event"] for e in recorder.events]
+    assert names == ["run_started", "plan_computed", "node_planned", "node_failed", "run_failed"]
+    node_failed = next(e for e in recorder.events if e["event"] == "node_failed")
+    assert node_failed["error"] == "_BrokenStrError"
+    assert node_failed["message"] == "<unprintable _BrokenStrError>"
+    run_failed = next(e for e in recorder.events if e["event"] == "run_failed")
+    assert run_failed["failed"] == [str(node.path)]
+
+
+def test_broken_str_exception_keeps_pipeline_error_parallel(tmp_path):
+    """§1.1-b(並列)(rev7): 同じ保証を _run_parallel の node_failed 発行経路でも固定する。"""
+
+    def bad() -> pl.DataFrame:
+        raise _BrokenStrError()
+
+    bad_leaf = Node(tmp_path / "bad.parquet", bad)
+    ok_leaf = Node(tmp_path / "ok.parquet", lambda: pl.DataFrame({"x": [1]}))
+    combined = Node(
+        tmp_path / "combined.parquet",
+        lambda **dep_dfs: next(iter(dep_dfs.values())),
+        deps={"bad": bad_leaf, "ok": ok_leaf},
+    )
+
+    recorder = RunRecorder()
+    with recorder.attach(), pytest.raises(PipelineError) as exc_info:
+        run(combined, force=True, max_workers=2)
+    assert exc_info.value.node is bad_leaf
+
+    node_failed = [e for e in recorder.events if e["event"] == "node_failed"]
+    assert len(node_failed) == 1
+    assert node_failed[0]["node"] == str(bad_leaf.path)
+    assert node_failed[0]["message"] == "<unprintable _BrokenStrError>"
+    assert [e["event"] for e in recorder.events].count("run_failed") == 1

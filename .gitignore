@@ -10,5 +10,6 @@ wheels/
 .venv
 .DS_Store
 
-# Session-local tooling state
+# Claude Code local state (intentionally not shared; whitelist specific
+# files here if the team later wants to commit shared .claude/ config)
 .claude/

@@ -14,7 +14,7 @@ import time
 import polars as pl
 import pytest
 
-from conftest import AppendFailsForEvent, assert_subprocess_silent
+from conftest import MOKTAN_TIMESTAMP_RE, AppendFailsForEvent, assert_subprocess_silent
 from conftest import four_node_dag as _four_node_dag
 from conftest import moktan_event, moktan_warnings
 from moktan import Node, PipelineError, RunRecorder, run
@@ -492,7 +492,10 @@ def test_jsonl_stays_valid_when_a_broken_sink_triggers_a_fallback_warning(
     _JSONFormatter fell back to plain-text formatting for such records,
     writing a non-JSON line into the configured JSON Lines file -- breaking
     the §6.2 contract that every line independently parses with json.loads,
-    on exactly the run where a sink already misbehaved."""
+    on exactly the run where a sink already misbehaved.
+
+    rev6 §2.2: the fallback line also carries a timestamp (same format as
+    every other event line) and the run_id of the event that triggered it."""
     from moktan.events import configure_logging
 
     logger = moktan_logger_state
@@ -510,6 +513,8 @@ def test_jsonl_stays_valid_when_a_broken_sink_triggers_a_fallback_warning(
     assert len(lines) == 1  # only the fallback warning is at WARNING+
     payload = json.loads(lines[0])  # must not raise
     assert payload["event"] == "log_message"
+    assert MOKTAN_TIMESTAMP_RE.match(payload["timestamp"])
+    assert payload["run_id"] == broken.events[0]["run_id"]
     assert "run_finished" in payload["message"]
 
 

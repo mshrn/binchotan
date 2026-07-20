@@ -1,9 +1,7 @@
 """Structured event emission: the single source of truth for run observability.
 
-``_emit`` is the only place moktan emits *events*; the sole other write to the
-"moktan" logger is ``_dispatch``'s best-effort broken-sink warning (a plain
-record, handled by ``_JSONFormatter``'s fallback). It fans out to two
-independent consumers:
+``_emit`` is the only place moktan emits events (flume_logging_spec.md §2).
+It fans out to two independent consumers:
 
 - the stdlib ``"moktan"`` logger, via a private structlog-wrapped logger. This is
   subject to normal ``logging`` configuration (level, handlers) -- silent unless
@@ -13,6 +11,9 @@ independent consumers:
   every event (including DEBUG-only ones like ``node_planned``), because
   visualization must not silently break when an application raises the
   ``"moktan"`` logger's level.
+
+The sole non-event write to the "moktan" logger is ``_dispatch``'s broken-sink
+warning -- a plain record, covered by ``_JSONFormatter``'s fallback.
 
 moktan never calls ``structlog.configure()`` (that's global, and would clobber
 an application's own structlog setup); it builds one private wrapped logger
@@ -77,6 +78,21 @@ def _iso_timestamp(dt: datetime) -> str:
     return dt.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+def _safe_str(obj: object) -> str:
+    """str(obj) -- unless obj's __str__ itself raises, in which case a
+    placeholder is returned instead of letting the exception escape.
+    Every exception-to-message conversion feeding an event field MUST go
+    through this: plain str(exc) at an _emit call site is evaluated before
+    any of _emit's guards run, so a user exception with a broken __str__
+    would otherwise replace PipelineError with the __str__ error (rev7 §1.1).
+    KeyboardInterrupt/SystemExit from __str__ still propagate.
+    """
+    try:
+        return str(obj)
+    except Exception:  # noqa: BLE001
+        return f"<unprintable {type(obj).__name__}>"
+
+
 # --- console rendering (§6.1) -----------------------------------------------
 
 # The 3 pre-existing verbs keep their bare "<verb> <path>" first two tokens
@@ -94,14 +110,12 @@ def _format_duration(value: float) -> str:
     return f"{value:.2f}"
 
 
-# Single source of truth for "which characters break the one-event-one-line
-# console contract" (rev5 §1.3: `_needs_quoting` and the bare-token escape
-# below used to each hardcode `\n` separately, and both silently missed `\r`
-# as a result). rev6 §1.4: the rationale is "protect splitlines()-based
-# consumers", so the set covers every character str.splitlines() treats as a
-# line boundary, not just \n/\r. Quoted positions are safe once _needs_quoting
-# triggers (json.dumps escapes all control chars and, with ensure_ascii=True,
-# all non-ASCII); the bare-token position uses the explicit escape text below.
+# Single source of truth for characters that break the one-event-one-line
+# console contract: exactly the set str.splitlines() treats as line
+# boundaries (rev6 §1.4 -- the rationale is splitlines-safety, so the set
+# must match it). _needs_quoting and _escape_bare_token both derive from
+# this dict. Quoted positions are safe via json.dumps escaping; the
+# bare-token position uses the escape text on the right.
 _LINE_BREAK_ESCAPES: dict[str, str] = {
     "\n": "\\n",
     "\r": "\\r",
@@ -111,8 +125,8 @@ _LINE_BREAK_ESCAPES: dict[str, str] = {
     "\x1d": "\\x1d",
     "\x1e": "\\x1e",
     "\x85": "\\x85",
-    " ": "\\u2028",
-    " ": "\\u2029",
+    "\u2028": "\\u2028",
+    "\u2029": "\\u2029",
 }
 
 _QUOTE_TRIGGERS: tuple[str, ...] = (" ", '"', "=", *_LINE_BREAK_ESCAPES)
@@ -237,14 +251,10 @@ def _dispatch(event: dict[str, Any]) -> None:
         try:
             sink.events.append(event)
         except Exception as exc:  # noqa: BLE001 - sink isolation, see comment
-            # A broken sink must never be able to affect what run() returns or
-            # raises, no matter which _emit call site it chokes on -- isolating
-            # it here (instead of wrapping individual call sites in runner.py)
-            # makes that true by construction everywhere at once, and a broken
-            # sink no longer starves sinks registered after it in the loop.
-            # KeyboardInterrupt/SystemExit deliberately are NOT caught: an
-            # operator's Ctrl-C must still abort the run even if it lands
-            # inside a sink's .append().
+            # Sink isolation (rev5 §1.1): a broken sink must never affect what
+            # run() returns/raises, nor starve sinks later in the loop.
+            # KeyboardInterrupt/SystemExit deliberately propagate -- Ctrl-C
+            # must still abort even mid-append.
             try:
                 logger.warning(
                     "moktan: sink %s failed to record event %r (run_id=%s): %r",
@@ -297,14 +307,12 @@ def _emit(
         try:
             _struct_logger.log(level, event, **{k: v for k, v in ordered.items() if k != "event"})
         except Exception:  # noqa: BLE001
-            # A failure here means the application's logging setup on the
-            # "moktan" logger is broken (a raising Filter, a non-conforming
-            # Handler.emit -- stdlib's handleError only covers emit bodies
-            # that follow the try/except convention; Logger.filter() and a
-            # non-conforming Handler.handle() propagate their exceptions
-            # untouched). The notification channel itself is what failed, so
-            # there is nothing sane to notify through: drop it. Sinks already
-            # received the event via _dispatch above. KeyboardInterrupt/
+            # Either the app's logging setup on the "moktan" logger raised
+            # (stdlib absorbs only conforming Handler.emit errors -- see
+            # review_notes.md rev6 §1.1), or moktan's own render processor
+            # did (it runs inside this call). Both are notification-channel
+            # failures with nothing sane to notify through: drop it. Sinks
+            # already got the event via _dispatch. KeyboardInterrupt/
             # SystemExit still propagate.
             pass
 
